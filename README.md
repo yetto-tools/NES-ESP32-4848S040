@@ -10,6 +10,18 @@ Incluye controles táctiles en pantalla, **Zapper táctil** (Duck Hunt y similar
 > distribuirlos de forma ilegal. Usa solo copias de seguridad de cartuchos que poseas legítimamente. Nintendo y
 > los demás titulares conservan todos sus derechos; ver el [aviso legal](#aviso-legal) al final.
 
+## Capturas
+
+Fotogramas de un video del dispositivo ejecutando el emulador (fotos tomadas con un teléfono, por eso se ven
+algo torcidas y con reflejos).
+
+| Pantalla de juego y controles | Controles táctiles en uso | Scroll del escenario |
+|---|---|---|
+| ![Juego en pantalla con la cruceta, A, B, Select, Start y MENU](docs/ejemplo-juego.jpg) | ![Dedos sobre la cruceta y el botón A](docs/ejemplo-tactil.jpg) | ![Escenario con la escalera mientras el personaje avanza](docs/ejemplo-escenario.jpg) |
+
+La imagen del juego ocupa la parte superior (360×288 px, recortada 8 columnas por lado) y los controles táctiles
+la parte inferior: cruceta, `A`, `B`, `SELECT`, `START` y `MENU`.
+
 ## Hardware
 
 | Componente | Detalle |
