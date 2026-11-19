@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "sdkconfig.h"
 #include "lcd_rgb.h"
 
@@ -22,8 +23,20 @@
 /* D0..D4 = B0..B4, D5..D10 = G0..G5, D11..D15 = R0..R4 */
 #define DATA_PINS   { 4, 5, 6, 7, 15,  8, 20, 3, 46, 9, 10,  11, 12, 13, 14, 0 }
 
+/* Reloj de pixel: con 12 MHz el panel refresca a ~46 Hz (< 60 cuadros del juego) y el corte se mueve;
+ * con 16 MHz refresca a ~61 Hz. Si la imagen se ve inestable, volver a 12000000. */
+#define LCD_PCLK_HZ  16000000
+
 static const char *TAG = "lcd";
 static uint16_t *fb;
+static SemaphoreHandle_t vsync_sem;      /* se libera al terminar cada cuadro del panel */
+
+static bool IRAM_ATTR on_vsync(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *e, void *u)
+{
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(vsync_sem, &hp);
+    return hp == pdTRUE;
+}
 
 /* ---- ST7701: SPI de 3 hilos por bit-bang (9 bits: bit D/C + 8 de dato) ---- */
 static void st_write(bool data, uint8_t v)
@@ -112,7 +125,7 @@ void lcd_init(void)
     esp_lcd_rgb_panel_config_t cfg = {
         .clk_src = LCD_CLK_SRC_DEFAULT,
         .timings = {
-            .pclk_hz = 12 * 1000 * 1000,
+            .pclk_hz = LCD_PCLK_HZ,
             .h_res = LCD_W, .v_res = LCD_H,
             .hsync_pulse_width = 8, .hsync_back_porch = 20, .hsync_front_porch = 10,
             .vsync_pulse_width = 8, .vsync_back_porch = 10, .vsync_front_porch = 10,
@@ -130,6 +143,9 @@ void lcd_init(void)
     };
     esp_lcd_panel_handle_t panel;
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&cfg, &panel));
+    vsync_sem = xSemaphoreCreateBinary();
+    esp_lcd_rgb_panel_event_callbacks_t cbs = { .on_vsync = on_vsync };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel, &cbs, NULL));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
     void *p;
@@ -163,6 +179,12 @@ void lcd_draw_game(const uint8_t **lines, const uint16_t *pal)
     if (!xmap_ready) {
         for (int x = 0; x < GAME_W; x++) xmap[x] = x * 256 / GAME_W;
         xmap_ready = 1;
+    }
+    /* Escribir justo despues del vsync: el escritor (mas rapido que el haz) va por delante del barrido
+     * y no se ve el corte. Si el panel no avisa (40 ms), se dibuja igual. */
+    if (vsync_sem) {
+        xSemaphoreTake(vsync_sem, 0);                          /* descartar un aviso viejo */
+        xSemaphoreTake(vsync_sem, pdMS_TO_TICKS(40));
     }
     int prev_sy = -1;
     for (int y = 0; y < GAME_H; y++) {
