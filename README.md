@@ -4,7 +4,7 @@ Emulador de NES ([Nofrendo](components/nofrendo/AUTHORS)) sobre **ESP-IDF v6.1**
 **Guition ESP32-4848S040**: pantalla táctil de 4" 480×480, microSD y bocina integrada.
 Incluye controles táctiles en pantalla, **Zapper táctil** (Duck Hunt y similares) y audio por I2S.
 
-![La placa ESP32-4848S040 ejecutando el emulador, con los controles táctiles en pantalla](docs/dispositivo.jpg)
+![La placa ESP32-4848S040 ejecutando Duck Hunt, con los controles táctiles en pantalla](docs/duck-hunt-juego.jpg)
 
 > **No incluye ROMs ni apoya la piratería.** Este proyecto no contiene juegos y no se creó para copiarlos ni
 > distribuirlos de forma ilegal. Usa solo copias de seguridad de cartuchos que poseas legítimamente. Nintendo y
@@ -12,15 +12,26 @@ Incluye controles táctiles en pantalla, **Zapper táctil** (Duck Hunt y similar
 
 ## Capturas
 
-Fotogramas de un video del dispositivo ejecutando el emulador (fotos tomadas con un teléfono, por eso se ven
-algo torcidas y con reflejos).
+Fotos del dispositivo real, tomadas con un teléfono (de ahí algún reflejo).
 
-| Pantalla de juego y controles | Controles táctiles en uso | Scroll del escenario |
+| Menú de selección de juego | Duck Hunt: pantalla de título | Super Mario Bros. 3 (mapper MMC3) |
 |---|---|---|
-| ![Juego en pantalla con la cruceta, A, B, Select, Start y MENU](docs/ejemplo-juego.jpg) | ![Dedos sobre la cruceta y el botón A](docs/ejemplo-tactil.jpg) | ![Escenario con la escalera mientras el personaje avanza](docs/ejemplo-escenario.jpg) |
+| ![Menú "ELIGE UN JUEGO" con las ROMs de la microSD; la Z verde marca los juegos con Zapper y abajo están los botones](docs/menu-elegir-juego.jpg) | ![Pantalla de título de Duck Hunt con los controles táctiles debajo](docs/duck-hunt-titulo.jpg) | ![Mapa del mundo 1 de Super Mario Bros. 3 con la barra de estado y los controles táctiles](docs/smb3-mapa.jpg) |
+
+### Duck Hunt con el Zapper táctil
+
+| Ronda 1 | El perro al inicio de la partida | Ronda 1 con 2 000 puntos |
+|---|---|---|
+| ![Duck Hunt, ronda 1, marcador 001000](docs/duck-hunt-juego.jpg) | ![El perro de Duck Hunt olfateando entre la hierba, marcador 000000](docs/duck-hunt-perro.jpg) | ![Duck Hunt, ronda 1, marcador 002000](docs/duck-hunt-ronda.jpg) |
 
 La imagen del juego ocupa la parte superior (360×288 px, recortada 8 columnas por lado) y los controles táctiles
 la parte inferior: cruceta, `A`, `B`, `SELECT`, `START` y `MENU`.
+
+### Más capturas (fotogramas de un video)
+
+| Pantalla de juego | Controles táctiles en uso | Scroll del escenario | Vista general |
+|---|---|---|---|
+| ![Juego en pantalla con la cruceta, A, B, Select, Start y MENU](docs/ejemplo-juego.jpg) | ![Dedos sobre la cruceta y el botón A](docs/ejemplo-tactil.jpg) | ![Escenario con la escalera mientras el personaje avanza](docs/ejemplo-escenario.jpg) | ![La placa ejecutando Super Mario Bros.](docs/dispositivo.jpg) |
 
 ## Hardware
 
@@ -223,8 +234,10 @@ components/nofrendo/   emulador (código de 2001, modificado)
 - **Uso responsable:** usa el emulador solo con copias de seguridad que hayas hecho tú mismo de cartuchos que posees
   legítimamente, o con juegos homebrew y de dominio público. Las leyes sobre copias de seguridad cambian según el
   país; cumplir con la ley de tu jurisdicción es tu responsabilidad. Esto no es asesoría legal.
-- **Capturas e imágenes:** `docs/ejemplo-*.jpg` y `docs/dispositivo.jpg` muestran un juego comercial en pantalla
-  solo como ilustración del funcionamiento. Las fotos de la placa son de terceros (ver la sección de hardware).
+- **Capturas e imágenes:** las fotos de `docs/` (`duck-hunt-*.jpg`, `smb3-mapa.jpg`, `menu-elegir-juego.jpg`,
+  `ejemplo-*.jpg` y `dispositivo.jpg`) muestran juegos comerciales (Duck Hunt, Super Mario Bros., Super Mario Bros. 3,
+  entre otros) en pantalla solo como ilustración del funcionamiento. Las fotos de la placa son de terceros (ver la
+  sección de hardware).
 - **Sin garantía:** el software se ofrece "tal cual", sin garantía de ningún tipo, bajo los términos de la licencia.
 - **Retirada de contenido:** si eres titular de derechos y consideras que algún contenido de este repositorio
   infringe tus derechos, abre un issue y se retirará.
@@ -243,4 +256,4 @@ licencia del emulador. El texto completo está en [`LICENSE`](LICENSE).
   (sección 3), así que cambiar a GPLv2 sería compatible si más adelante lo prefieres.
 - Si reutilizas código del repositorio de Espressif que esté fuera de Nofrendo, su README lo indica bajo
   Apache License 2.0. No he comprobado si este repositorio contiene alguno.
-- La captura de `docs/dispositivo.jpg` muestra un juego comercial en pantalla; el repositorio no incluye ROMs.
+- Las capturas de `docs/` muestran juegos comerciales en pantalla; el repositorio no incluye ROMs.
