@@ -1,0 +1,84 @@
+menu "NES ESP32-S3 - Pantalla 480x480 (ST7701 RGB)"
+
+config LCD_MIRROR_X
+    bool "Espejo horizontal (SDIR)"
+    default y
+config LCD_MIRROR_Y
+    bool "Espejo vertical (MADCTL ML)"
+    default y
+
+endmenu
+
+menu "NES ESP32-S3 - Tactil (GT911)"
+
+config TOUCH_SDA
+    int "GPIO SDA"
+    default 19
+config TOUCH_SCL
+    int "GPIO SCL"
+    default 45
+
+endmenu
+
+menu "NES ESP32-S3 - Zapper"
+
+config ZAPPER_ENABLE
+    bool "Zapper tactil activo por defecto si no se conoce el juego"
+    default y
+
+endmenu
+
+menu "NES ESP32-S3 - Audio"
+
+choice AUDIO_OUT
+    prompt "Salida de audio"
+    default AUDIO_I2S
+config AUDIO_NONE
+    bool "Sin sonido"
+config AUDIO_I2S
+    bool "I2S (bocina NS4168 de la placa, o DAC externo en H1)"
+endchoice
+
+config I2S_BCK
+    int "GPIO BCK"
+    depends on AUDIO_I2S
+    default 1
+config I2S_LRCK
+    int "GPIO LRCK (WS)"
+    depends on AUDIO_I2S
+    default 2
+config I2S_DIN
+    int "GPIO DIN"
+    depends on AUDIO_I2S
+    default 40
+config AUDIO_VOLUME
+    int "Volumen (%)"
+    depends on AUDIO_I2S
+    range 0 400
+    default 100
+
+endmenu
+
+menu "NES ESP32-S3 - Tarjeta SD (ROMs)"
+
+config SD_ENABLE
+    bool "Leer ROMs de la microSD al arrancar"
+    default y
+config SD_CLK
+    int "GPIO CLK (verificado con la placa)"
+    depends on SD_ENABLE
+    default 48
+config SD_CMD
+    int "GPIO CMD (verificado con la placa)"
+    depends on SD_ENABLE
+    default 47
+config SD_D0
+    int "GPIO D0 (sin verificar)"
+    depends on SD_ENABLE
+    default 41
+config SD_MHZ
+    int "Velocidad (MHz)"
+    depends on SD_ENABLE
+    default 20
+
+endmenu
