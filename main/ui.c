@@ -111,6 +111,7 @@ void ui_draw_static(void)
     ui_fill_rect(0, GAME_Y + GAME_H, LCD_W, LCD_H - (GAME_Y + GAME_H), C_BG);
     shown = 0xFFFFFFFF;
     ui_update(0);
+    lcd_flush_rows(GAME_Y + GAME_H, LCD_H);       /* fondo y botones iniciales: filas completas, una sola vez */
 }
 
 void ui_update(uint32_t p)
@@ -120,11 +121,29 @@ void ui_update(uint32_t p)
     uint32_t chg = p ^ shown;
     shown = p;
     const uint32_t DP = (1u << BTN_UP) | (1u << BTN_DOWN) | (1u << BTN_LEFT) | (1u << BTN_RIGHT);
-    if (chg & DP)               draw_dpad(p);
-    if (chg & (1u << BTN_A))    draw_round(A_CX, A_CY, "A", p & (1u << BTN_A), C_A, C_A_ON);
-    if (chg & (1u << BTN_B))    draw_round(B_CX, B_CY, "B", p & (1u << BTN_B), C_B, C_B_ON);
-    if (chg & (1u << BTN_SELECT)) draw_pill(SEL_X, SEL_Y, "SELECT", p & (1u << BTN_SELECT));
-    if (chg & (1u << BTN_START))  draw_pill(STA_X, STA_Y, "START", p & (1u << BTN_START));
-    if (chg & (1u << BTN_MENU))   draw_pill(MENU_X, MENU_Y, "MENU", p & (1u << BTN_MENU));
-    lcd_flush_rows(GAME_Y + GAME_H, LCD_H);
+    /* Solo se marca el rectangulo de cada boton que cambio (antes, las 188 filas completas de la zona de controles) */
+    if (chg & DP) {
+        draw_dpad(p);
+        lcd_dirty_rect(DPAD_CX - DPAD_R - 4, DPAD_CY - DPAD_R - 4, 2 * DPAD_R + 8, 2 * DPAD_R + 8);
+    }
+    if (chg & (1u << BTN_A)) {
+        draw_round(A_CX, A_CY, "A", p & (1u << BTN_A), C_A, C_A_ON);
+        lcd_dirty_rect(A_CX - BTN_R - 2, A_CY - BTN_R - 2, 2 * BTN_R + 5, 2 * BTN_R + 5);
+    }
+    if (chg & (1u << BTN_B)) {
+        draw_round(B_CX, B_CY, "B", p & (1u << BTN_B), C_B, C_B_ON);
+        lcd_dirty_rect(B_CX - BTN_R - 2, B_CY - BTN_R - 2, 2 * BTN_R + 5, 2 * BTN_R + 5);
+    }
+    if (chg & (1u << BTN_SELECT)) {
+        draw_pill(SEL_X, SEL_Y, "SELECT", p & (1u << BTN_SELECT));
+        lcd_dirty_rect(SEL_X, SEL_Y, PILL_W, PILL_H);
+    }
+    if (chg & (1u << BTN_START)) {
+        draw_pill(STA_X, STA_Y, "START", p & (1u << BTN_START));
+        lcd_dirty_rect(STA_X, STA_Y, PILL_W, PILL_H);
+    }
+    if (chg & (1u << BTN_MENU)) {
+        draw_pill(MENU_X, MENU_Y, "MENU", p & (1u << BTN_MENU));
+        lcd_dirty_rect(MENU_X, MENU_Y, PILL_W, PILL_H);
+    }
 }

@@ -321,6 +321,10 @@ static void nes_renderframe(bool draw_flag)
 
       if (241 == nes.scanline)
       {
+         /* Entrada: se lee aqui, justo antes del vblank. El juego lee el mando en su NMI, asi que leerla al
+         ** inicio del cuadro la dejaba ~7.5 ms mas vieja de lo necesario (retardo de entrada). */
+         osd_getinput();
+
          /* 7-9 cycle delay between when VINT flag goes up and NMI is taken */
          t = prof_ccount();
          elapsed_cycles = nes6502_execute(7);
@@ -422,7 +426,6 @@ void nes_emulate(void)
       else if (frames_to_render > 1)
       {
          frames_to_render--;
-         osd_getinput();
          nes_renderframe(false);
          system_video(false);
       }
@@ -430,7 +433,6 @@ void nes_emulate(void)
                || false == nes.autoframeskip)
       {
          frames_to_render = 0;
-         osd_getinput();
          nes_renderframe(true);
          system_video(true);
       }

@@ -28,3 +28,7 @@ void lcd_fill(uint16_t color);
 void lcd_draw_game(const uint8_t **lines, const uint16_t *palette, int mira_x, int mira_y);
 /* Diagnostico: medias (ms/cuadro) de convertir+escribir y de esperar el cambio de buffer desde la ultima llamada */
 void lcd_stats(float *conv_ms, float *espera_ms);
+/* Diagnostico: ms por cuadro de calcular pixeles, volcar a PSRAM y sincronizar la interfaz */
+void lcd_stats_detalle(float *calc_ms, float *vol_ms, float *sinc_ms);
+/* Marca un rectangulo del lienzo de la interfaz como cambiado, sin presentarlo (se copia con el siguiente cuadro de juego) */
+void lcd_dirty_rect(int x, int y, int w, int h);

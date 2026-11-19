@@ -41,7 +41,34 @@ static const char *TAG = "lcd";
 #define NFB 3
 static uint16_t *hw[NFB];
 static uint16_t *fb;
-static int dmin[NFB], dmax[NFB];            /* filas de fb pendientes de copiar a cada hw[] */
+/* Zonas de fb pendientes de copiar a cada hw[]: por fila, el rango de columnas [dx0, dx1) cambiado, y el rango de filas.
+ * Antes solo se guardaban filas completas (el rango que envuelve todos los cambios): un boton obligaba a copiar ~180 filas. */
+static int16_t dx0[NFB][LCD_H], dx1[NFB][LCD_H];
+static int dy0[NFB], dy1[NFB];
+static portMUX_TYPE dmux = portMUX_INITIALIZER_UNLOCKED;   /* protege las marcas; no bloquea a la tarea del tactil */
+
+static void dirty_reset(void)
+{
+    for (int b = 0; b < NFB; b++) {
+        for (int y = 0; y < LCD_H; y++) { dx0[b][y] = LCD_W; dx1[b][y] = 0; }
+        dy0[b] = LCD_H; dy1[b] = -1;
+    }
+}
+
+/* Marca [x0, x1) x [y0, y1) como cambiado para todos los buffers */
+static void mark(int x0, int y0, int x1, int y1)
+{
+    portENTER_CRITICAL(&dmux);
+    for (int b = 0; b < NFB; b++) {
+        for (int y = y0; y < y1; y++) {
+            if (x0 < dx0[b][y]) dx0[b][y] = (int16_t)x0;
+            if (x1 > dx1[b][y]) dx1[b][y] = (int16_t)x1;
+        }
+        if (y0 < dy0[b]) dy0[b] = y0;
+        if (y1 - 1 > dy1[b]) dy1[b] = y1 - 1;
+    }
+    portEXIT_CRITICAL(&dmux);
+}
 static volatile int req, shown;
 static bool game_mode;                      /* true tras el primer cuadro de juego */
 static SemaphoreHandle_t lcd_mtx, frame_sem;
@@ -184,8 +211,8 @@ void lcd_init(void)
     ESP_ERROR_CHECK(canvas ? ESP_OK : ESP_ERR_NO_MEM);
     for (int b = 0; b < NFB; b++) {
         memset(hw[b], 0, (size_t)LCD_W * LCD_H * 2);
-        dmin[b] = LCD_H; dmax[b] = -1;
     }
+    dirty_reset();
     req = shown = 0;                /* el panel arranca mostrando hw[0] */
     fb = canvas;                    /* al final: lcd_init() sale temprano si fb ya existe */
     lcd_fill(0);
@@ -209,10 +236,17 @@ static int libre(void)
 /* Copia a hw[b] las filas de fb que cambiaron desde la ultima vez que se sincronizo ese buffer */
 static void sync_rows(int b)
 {
-    if (dmax[b] < dmin[b]) return;
-    size_t off = (size_t)dmin[b] * LCD_W, n = (size_t)(dmax[b] - dmin[b] + 1) * LCD_W;
-    memcpy(hw[b] + off, fb + off, n * 2);
-    dmin[b] = LCD_H; dmax[b] = -1;
+    portENTER_CRITICAL(&dmux);
+    int ya = dy0[b], yb = dy1[b];
+    dy0[b] = LCD_H; dy1[b] = -1;                  /* lo que se marque desde ahora cuenta para la proxima vez */
+    portEXIT_CRITICAL(&dmux);
+    for (int y = ya; y <= yb; y++) {
+        portENTER_CRITICAL(&dmux);
+        int a = dx0[b][y], e = dx1[b][y];
+        dx0[b][y] = LCD_W; dx1[b][y] = 0;
+        portEXIT_CRITICAL(&dmux);
+        if (e > a) memcpy(hw[b] + (size_t)y * LCD_W + a, fb + (size_t)y * LCD_W + a, (size_t)(e - a) * 2);
+    }
 }
 
 /* Pide mostrar hw[w] en el siguiente cuadro del panel. No espera. */
@@ -228,10 +262,7 @@ void lcd_flush_rows(int y0, int y1)
     if (y1 > LCD_H) y1 = LCD_H;
     if (y1 <= y0 || !lcd_mtx) return;
     xSemaphoreTake(lcd_mtx, portMAX_DELAY);
-    for (int b = 0; b < NFB; b++) {
-        if (y0 < dmin[b]) dmin[b] = y0;
-        if (y1 - 1 > dmax[b]) dmax[b] = y1 - 1;
-    }
+    mark(0, y0, LCD_W, y1);
     if (!game_mode) {            /* menus y calibracion: mostrar ya y esperar a que se vea. En juego, con el siguiente cuadro */
         int w = libre();
         sync_rows(w);
@@ -242,10 +273,38 @@ void lcd_flush_rows(int y0, int y1)
     xSemaphoreGive(lcd_mtx);
 }
 
+/* Marca un rectangulo del lienzo como cambiado (en juego se copia a los buffers con el siguiente cuadro). No bloquea. */
+void lcd_dirty_rect(int x, int y, int w, int h)
+{
+    int x1 = x + w, y1 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > LCD_W) x1 = LCD_W;
+    if (y1 > LCD_H) y1 = LCD_H;
+    if (x1 <= x || y1 <= y) return;
+    mark(x, y, x1, y1);
+}
+
 void lcd_fill(uint16_t color)
 {
     for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = color;
     lcd_flush_rows(0, LCD_H);
+}
+
+/* Detalle del tiempo de dibujo (ciclos de CPU, 240 por microsegundo): calcular pixeles, volcar a PSRAM, sincronizar interfaz */
+static volatile uint32_t pc_calc, pc_vol, pc_sinc, pc_n;
+static inline uint32_t ccount(void)
+{
+    uint32_t c;
+    __asm__ __volatile__("rsr %0, ccount" : "=a"(c));
+    return c;
+}
+
+void lcd_stats_detalle(float *calc_ms, float *vol_ms, float *sinc_ms)
+{
+    float k = 1.0f / 240000.0f / (pc_n ? pc_n : 1);
+    *calc_ms = pc_calc * k; *vol_ms = pc_vol * k; *sinc_ms = pc_sinc * k;
+    pc_calc = pc_vol = pc_sinc = pc_n = 0;
 }
 
 void lcd_draw_game(const uint8_t **lines, const uint16_t *pal, int mira_x, int mira_y)
@@ -266,11 +325,11 @@ void lcd_draw_game(const uint8_t **lines, const uint16_t *pal, int mira_x, int m
                 for (int x = IMG_X + IMG_W; x < LCD_W; x++) fila[x] = 0;
             }
         }
-        for (int b = 0; b < NFB; b++) { dmin[b] = 0; dmax[b] = LCD_H - 1; }
+        mark(0, 0, LCD_W, LCD_H);
     }
     game_mode = true;
     int w = libre();
-    sync_rows(w);                                              /* botones u otras filas de la interfaz pendientes */
+    { uint32_t cs = ccount(); sync_rows(w); pc_sinc += ccount() - cs; }                                              /* botones u otras filas de la interfaz pendientes */
     uint16_t *base = hw[w];
     int prev_sy = -1;
     for (int y = 0; y < GAME_H; y++) {
@@ -278,14 +337,18 @@ void lcd_draw_game(const uint8_t **lines, const uint16_t *pal, int mira_x, int m
         if (sy != prev_sy) {                                   /* linea de origen nueva: convertirla (si no, se repite la anterior) */
             const uint8_t *src = lines[sy] + IMG_CROP;         /* se descartan 8 columnas por lado (overscan) */
             /* 240 columnas a 360 px = 1.5x: cada 2 pixeles origen (a, b) dan 3 de destino (a, a, b) */
+            uint32_t cc = ccount();
             uint16_t *o = rowbuf;
             for (int m = 0; m < IMG_W / 3; m++, o += 3) {
                 uint16_t a = pal[src[2 * m]], b = pal[src[2 * m + 1]];
                 o[0] = a; o[1] = a; o[2] = b;
             }
+            pc_calc += ccount() - cc;
             prev_sy = sy;
         }
+        uint32_t cv = ccount();
         memcpy(base + (GAME_Y + y) * LCD_W + IMG_X, rowbuf, IMG_W * 2);
+        pc_vol += ccount() - cv;
     }
     if (mira_x >= 0) {                                         /* mira roja del Zapper, dentro del area de juego */
         const uint16_t rojo = RGB565(255, 40, 40);
@@ -305,5 +368,6 @@ void lcd_draw_game(const uint8_t **lines, const uint16_t *pal, int mira_x, int m
     st_conv += t1 - t0;
     st_espera += esp_timer_get_time() - t1;
     st_n++;
+    pc_n++;
     xSemaphoreGive(lcd_mtx);
 }

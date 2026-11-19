@@ -303,6 +303,10 @@ static void videoTask(void *arg)
                 prof_apu = prof_copia = 0;
                 uint32_t n = fd + fs ? fd + fs : 1;
                 float k = 1.0f / 240000.0f / n;
+                float d_calc, d_vol, d_sinc;
+                lcd_stats_detalle(&d_calc, &d_vol, &d_sinc);
+                ESP_LOGI("lcd", "dibujo por cuadro: calcular pixeles %.2f ms + volcar a PSRAM %.2f ms + sincronizar interfaz %.2f ms",
+                         d_calc, d_vol, d_sinc);
                 ESP_LOGI("emu", "ms/cuadro: total %.2f = CPU %.2f + PPU %.2f + mapper %.2f + otros %.2f | APU %.2f copia %.2f | "
                          "dibujados %u saltados %u",
                          tot * k, cpu * k, ppu * k, map * k, (tot - cpu - ppu - map) * k,
