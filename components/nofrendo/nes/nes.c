@@ -352,8 +352,7 @@ static void system_video(bool draw)
    /* blit to screen */
    vid_flush();
 
-   /* grab input */
-   osd_getinput();
+   /* la entrada se lee en nes_emulate(), justo antes de emular cada cuadro (menos retardo) */
 }
 
 /* main emulation loop */
@@ -383,11 +382,13 @@ void nes_emulate(void)
       {
          /* TODO: dim the screen, and pause/silence the apu */
          system_video(true);
+         osd_getinput();
          frames_to_render = 0;
       }
       else if (frames_to_render > 1)
       {
          frames_to_render--;
+         osd_getinput();
          nes_renderframe(false);
          system_video(false);
       }
@@ -395,6 +396,7 @@ void nes_emulate(void)
                || false == nes.autoframeskip)
       {
          frames_to_render = 0;
+         osd_getinput();
          nes_renderframe(true);
          system_video(true);
       }

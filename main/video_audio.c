@@ -9,6 +9,7 @@
 #include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #if CONFIG_AUDIO_I2S
 #include "driver/i2s_std.h"
@@ -41,13 +42,14 @@
 #define NES_H        NES_SCREEN_HEIGHT    /* 240: la PPU escribe las 240 lineas */
 
 /* ---------------- Timer ---------------- */
-static TimerHandle_t timer;
+/* esp_timer en microsegundos: xTimerCreate con periodo entero de ticks daba 16 ms (62.5 Hz) en vez de 16.67 ms */
+static esp_timer_handle_t timer;
 
 int osd_installtimer(int frequency, void *func, int funcsize, void *counter, int countersize)
 {
-    timer = xTimerCreate("nes", configTICK_RATE_HZ / frequency, pdTRUE, NULL,
-                         (TimerCallbackFunction_t)func);
-    xTimerStart(timer, 0);
+    esp_timer_create_args_t args = { .callback = (esp_timer_cb_t)func, .name = "nes" };
+    if (esp_timer_create(&args, &timer) != ESP_OK) return -1;
+    esp_timer_start_periodic(timer, 1000000 / frequency);
     return 0;
 }
 
@@ -56,29 +58,61 @@ static void (*audio_callback)(void *buffer, int length) = NULL;
 static int16_t audio_in[FRAGSIZE];
 #if CONFIG_AUDIO_I2S
 static i2s_chan_handle_t i2s_tx;
-static int16_t audio_out[FRAGSIZE * 2];          /* estereo: L y R iguales */
 #endif
+
+/* El emulador (nucleo 0) deja las muestras en un anillo y una tarea propia (nucleo 1) las manda al I2S:
+ * asi el emulador ya no se bloquea esperando espacio en el DMA del audio. */
+#define RING_N 4096                                  /* muestras mono (potencia de 2): ~185 ms */
+static int16_t ring[RING_N];
+static volatile uint32_t ring_head, ring_tail;       /* escribe el emulador / lee la tarea de audio */
+static TaskHandle_t audio_task_h;
+static volatile uint32_t audio_perdidas;             /* muestras descartadas por anillo lleno (diagnostico) */
 
 static void do_audio_frame(void)
 {
 #if CONFIG_AUDIO_I2S
-    if (!audio_callback) return;
+    if (!audio_callback || !i2s_tx) return;
     int left = SAMPLERATE / NES_REFRESH_RATE;
     while (left) {
         int n = left > FRAGSIZE ? FRAGSIZE : left;
         audio_callback(audio_in, n);
-        for (int i = 0; i < n; i++) {
-            int v = (audio_in[i] * CONFIG_AUDIO_VOLUME) / 100;
-            if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-            audio_out[2 * i] = audio_out[2 * i + 1] = (int16_t)v;
+        uint32_t head = ring_head;
+        uint32_t libres = RING_N - (head - __atomic_load_n(&ring_tail, __ATOMIC_ACQUIRE));
+        if (libres < (uint32_t)n) {                   /* anillo lleno: se descarta, no se bloquea al emulador */
+            audio_perdidas += n;
+        } else {
+            for (int i = 0; i < n; i++) {
+                int s = (audio_in[i] * CONFIG_AUDIO_VOLUME) / 100;
+                if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+                ring[(head + i) & (RING_N - 1)] = (int16_t)s;
+            }
+            __atomic_store_n(&ring_head, head + n, __ATOMIC_RELEASE);
         }
-        size_t written;
-        if (!i2s_tx || i2s_channel_write(i2s_tx, audio_out, n * 4, &written,
-                                         pdMS_TO_TICKS(100)) != ESP_OK) return;
         left -= n;
     }
+    if (audio_task_h) xTaskNotifyGive(audio_task_h);
 #endif
 }
+
+#if CONFIG_AUDIO_I2S
+static void audio_task(void *arg)
+{
+    static int16_t out[FRAGSIZE * 2];                /* estereo: L y R iguales */
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+        for (;;) {
+            uint32_t tail = ring_tail;
+            uint32_t disp = __atomic_load_n(&ring_head, __ATOMIC_ACQUIRE) - tail;
+            if (!disp) break;
+            int n = disp > FRAGSIZE ? FRAGSIZE : (int)disp;
+            for (int i = 0; i < n; i++) out[2 * i] = out[2 * i + 1] = ring[(tail + i) & (RING_N - 1)];
+            size_t written;
+            if (i2s_channel_write(i2s_tx, out, n * 4, &written, pdMS_TO_TICKS(100)) != ESP_OK) break;
+            __atomic_store_n(&ring_tail, tail + n, __ATOMIC_RELEASE);
+        }
+    }
+}
+#endif
 
 void osd_setsound(void (*playfunc)(void *buffer, int length)) { audio_callback = playfunc; }
 static void osd_stopsound(void) { audio_callback = NULL; }
@@ -89,7 +123,7 @@ static int osd_init_sound(void)
     /* PCM5102A: BCK, LRCK (LCK) y DIN. SCK del modulo a GND (usa su PLL interno). */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 4;
-    chan_cfg.dma_frame_num = 256;
+    chan_cfg.dma_frame_num = 128;                 /* 4 x 128 = ~23 ms de DMA */
     chan_cfg.auto_clear = true;                   /* silencio si no llegan datos */
     if (i2s_new_channel(&chan_cfg, &i2s_tx, NULL) != ESP_OK) {
         ESP_LOGW("audio", "No se pudo crear el canal I2S, sin sonido");
@@ -113,8 +147,9 @@ static int osd_init_sound(void)
             ESP_LOGW("audio", "No se pudo iniciar I2S, sin sonido");
             i2s_tx = NULL;
         } else {
-            ESP_LOGI("audio", "I2S PCM5102A: BCK=%d LRCK=%d DIN=%d, %d Hz",
+            ESP_LOGI("audio", "I2S: BCK=%d LRCK=%d DIN=%d, %d Hz",
                      CONFIG_I2S_BCK, CONFIG_I2S_LRCK, CONFIG_I2S_DIN, SAMPLERATE);
+            xTaskCreatePinnedToCore(audio_task, "audio", 3072, NULL, 6, &audio_task_h, 0);
         }
     }
 #endif
@@ -139,7 +174,16 @@ static void free_write(int num_dirties, rect_t *dirty_rects);
 static void custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects);
 
 static char fb[1];
-static QueueHandle_t vidQueue;
+/* Copias privadas de cada cuadro del emulador: el hilo de video convierte y muestra una copia mientras el
+ * emulador ya esta dibujando el siguiente cuadro en su propio buffer (leerlo directo partia la imagen).
+ * Estados: 0 libre, 1 esperando a mostrarse (solo una, la mas reciente), 2 mostrandose. */
+#define NSNAP 3
+static uint8_t *snap[NSNAP];
+static uint8_t snap_state[NSNAP];
+static int snap_wait = -1;
+static portMUX_TYPE snap_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t video_task;
+static volatile uint32_t emu_n, emu_sin_copia;   /* diagnostico: cuadros que entrega el emulador / sin copia libre */
 static bitmap_t *myBitmap;
 static uint16_t myPalette[256];
 static uint8_t palLum[256];
@@ -184,46 +228,66 @@ static void free_write(int num_dirties, rect_t *dirty_rects) { bmp_destroy(&myBi
 
 static void custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects)
 {
-    xQueueSend(vidQueue, &bmp, 0);      /* si la pantalla va ocupada, se salta el frame */
+    int w = -1;
+    emu_n++;
+    portENTER_CRITICAL(&snap_mux);
+    for (int i = 0; i < NSNAP; i++) if (snap_state[i] == 0) { w = i; break; }
+    portEXIT_CRITICAL(&snap_mux);
+    if (w >= 0 && snap[w]) {
+        for (int y = 0; y < NES_H; y++) memcpy(snap[w] + y * NES_W, bmp->line[y], NES_W);
+        portENTER_CRITICAL(&snap_mux);
+        if (snap_wait >= 0) snap_state[snap_wait] = 0;   /* cuadro anterior sin mostrar: se descarta, gana el mas nuevo */
+        snap_state[w] = 1;
+        snap_wait = w;
+        portEXIT_CRITICAL(&snap_mux);
+        xTaskNotifyGive(video_task);
+    } else {
+        emu_sin_copia++;
+    }
     do_audio_frame();
 }
-
-static void draw_mira(void);
 
 /* Corre en el nucleo 1; la emulacion en el nucleo 0 */
 static void videoTask(void *arg)
 {
-    bitmap_t *bmp = NULL;
     int frames = 0;
+    int64_t t_dibujo = 0;                      /* tiempo total en lcd_draw_game (convertir + esperar el cambio de buffer) */
     TickType_t t0 = xTaskGetTickCount();
     while (1) {
-        xQueueReceive(vidQueue, &bmp, portMAX_DELAY);
-        lcd_draw_game((const uint8_t **)bmp->line, myPalette);
-        draw_mira();
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        int r = -1;
+        portENTER_CRITICAL(&snap_mux);
+        r = snap_wait;
+        if (r >= 0) { snap_state[r] = 2; snap_wait = -1; }
+        portEXIT_CRITICAL(&snap_mux);
+        if (r < 0) continue;
+        const uint8_t *ln[NES_H];
+        for (int y = 0; y < NES_H; y++) ln[y] = snap[r] + y * NES_W;
+        int mx = -1, my = -1, tx, ty;          /* mira roja donde el sistema cree que se disparo */
+        if (zapper_activo() && gamepad_touch(&tx, &ty) &&
+            tx >= GAME_X && tx < GAME_X + GAME_W && ty >= GAME_Y && ty < GAME_Y + GAME_H) { mx = tx; my = ty; }
+        int64_t t_ini = esp_timer_get_time();
+        lcd_draw_game(ln, myPalette, mx, my);
+        t_dibujo += esp_timer_get_time() - t_ini;
+        portENTER_CRITICAL(&snap_mux);
+        snap_state[r] = 0;
+        portEXIT_CRITICAL(&snap_mux);
         frames++;
         TickType_t now = xTaskGetTickCount();
         if (now - t0 >= pdMS_TO_TICKS(5000)) {      /* FPS por el monitor serie */
-            ESP_LOGI("video", "%.1f fps en pantalla, RAM libre %u",
-                     frames * 1000.0f / pdTICKS_TO_MS(now - t0),
-                     (unsigned)esp_get_free_heap_size());
+            float conv_ms, espera_ms;
+            lcd_stats(&conv_ms, &espera_ms);
+            float seg = pdTICKS_TO_MS(now - t0) / 1000.0f;
+            ESP_LOGI("video", "emulador %.1f cuadros/s (sin copia %u) -> pantalla %.1f fps, dibujo %.1f ms (convertir %.1f + esperar %.1f), audio perdido %u",
+                     emu_n / seg, (unsigned)emu_sin_copia, frames / seg,
+                     frames ? t_dibujo / 1000.0f / frames : 0.0f, conv_ms, espera_ms,
+                     (unsigned)audio_perdidas);
+            emu_n = 0; emu_sin_copia = 0;
             frames = 0;
+            t_dibujo = 0;
             t0 = now;
         }
     }
-}
-
-/* Mira roja donde el sistema cree que se disparo (solo con Zapper activo y dedo en el juego) */
-static void draw_mira(void)
-{
-    int tx, ty;
-    if (!zapper_activo() || !gamepad_touch(&tx, &ty)) return;
-    if (tx < GAME_X || tx >= GAME_X + GAME_W || ty < GAME_Y || ty >= GAME_Y + GAME_H) return;
-    const uint16_t rojo = RGB565(255, 40, 40);
-    int x0 = tx - 10 < GAME_X ? GAME_X : tx - 10, x1 = tx + 11 > GAME_X + GAME_W ? GAME_X + GAME_W : tx + 11;
-    int y0 = ty - 10 < GAME_Y ? GAME_Y : ty - 10, y1 = ty + 11 > GAME_Y + GAME_H ? GAME_Y + GAME_H : ty + 11;
-    ui_fill_rect(x0, ty - 1, x1 - x0, 3, rojo);
-    ui_fill_rect(tx - 1, y0, 3, y1 - y0, rojo);
-    lcd_flush_rows(y0, y1);
 }
 
 /* ---------------- Entrada ---------------- */
@@ -253,7 +317,7 @@ void osd_getinput(void)
         if (zap_apunta > 0 && !(t && !was)) zap_apunta--;
         if (t && !was && zapper_activo() &&
             tx >= GAME_X && tx < GAME_X + GAME_W && ty >= GAME_Y && ty < GAME_Y + GAME_H) {
-            zap_ax = (tx - GAME_X) * NES_W / GAME_W;     /* el punto se fija al tocar; el dedo puede deslizarse despues */
+            zap_ax = IMG_CROP + (tx - IMG_X) * 2 / 3;     /* el punto se fija al tocar; el dedo puede deslizarse despues */
             zap_ay = (ty - GAME_Y) * NES_H / GAME_H;
             zap_disparo = ZAP_GATILLO;
             zap_apunta = ZAP_APUNTA;
@@ -345,8 +409,9 @@ int osd_init(void)
     lcd_init();
     ui_set_overlay(true);
     ui_draw_static();
-    vidQueue = xQueueCreate(1, sizeof(bitmap_t *));
-    xTaskCreatePinnedToCore(&videoTask, "videoTask", 6144, NULL, 5, NULL, 1);
+    for (int i = 0; i < NSNAP; i++)
+        snap[i] = heap_caps_malloc(NES_W * NES_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    xTaskCreatePinnedToCore(&videoTask, "videoTask", 6144, NULL, 5, &video_task, 0);
     osd_initinput();
     return 0;
 }

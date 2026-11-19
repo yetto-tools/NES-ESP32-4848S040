@@ -2,6 +2,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_partition.h"
+#include "esp_heap_caps.h"
+#include <string.h>
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -26,11 +28,23 @@ char *osd_getromdata(void)
         ESP_LOGE(TAG, "No se pudo mapear la ROM");
         return NULL;
     }
-    const char *r = romdata;
+    const unsigned char *r = romdata;
     if (r[0] != 'N' || r[1] != 'E' || r[2] != 'S') {
         ESP_LOGE(TAG, "La particion no contiene una ROM .nes valida (graba game.nes en 0x110000)");
+        return (char *)romdata;
     }
-    ESP_LOGI(TAG, "ROM en %p", romdata);
+    /* Copia la ROM a PSRAM: leerla de la flash (cache) hace esperar al emulador en cada fallo de cache,
+     * sobre todo al cargar mucho escenario (scroll rapido); la PSRAM es varias veces mas rapida. */
+    size_t tam = 16 + ((r[6] & 4) ? 512 : 0) + (size_t)r[4] * 16384 + (size_t)r[5] * 8192;
+    if (tam > part->size) tam = part->size;
+    void *copia = heap_caps_malloc(tam, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (copia) {
+        memcpy(copia, romdata, tam);
+        esp_partition_munmap(h);
+        ESP_LOGI(TAG, "ROM de %u bytes copiada a PSRAM (%p)", (unsigned)tam, copia);
+        return (char *)copia;
+    }
+    ESP_LOGW(TAG, "Sin memoria para copiar la ROM; se lee de la flash");
     return (char *)romdata;
 }
 
@@ -54,5 +68,5 @@ void app_main(void)
     gamepad_calibrate(force);
     rom_menu_run();      /* menu tactil de la tarjeta SD (si hay) */
     ESP_LOGI(TAG, "Iniciando emulador NES");
-    xTaskCreatePinnedToCore(nes_task, "nes", 12288, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(nes_task, "nes", 12288, NULL, 5, NULL, 1);   /* nucleo 1: solo el emulador */
 }

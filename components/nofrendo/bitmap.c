@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <noftypes.h>
+#include "esp_heap_caps.h"
 #include <bitmap.h>
 
 void bmp_clear(const bitmap_t *bitmap, uint8 color)
@@ -81,7 +82,10 @@ bitmap_t *bmp_create(int width, int height, int overdraw)
    int pitch;
 
    pitch = width + (overdraw * 2); /* left and right */
-   addr = malloc((pitch * height) + 3); /* add max 32-bit aligned adjustment */
+   /* RAM interna: el emulador dibuja aqui linea a linea; en PSRAM competia con el panel y con la copia del cuadro */
+   addr = heap_caps_malloc((pitch * height) + 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+   if (NULL == addr)
+      addr = malloc((pitch * height) + 3); /* add max 32-bit aligned adjustment */
    if (NULL == addr)
       return NULL;
 

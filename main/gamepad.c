@@ -106,7 +106,7 @@ static void touch_task(void *arg)
         state = m;
         was_down = tdown;
         if (m != prev) { ui_update(m); prev = m; }
-        vTaskDelay(pdMS_TO_TICKS(8));
+        vTaskDelay(pdMS_TO_TICKS(4));
     }
 }
 
@@ -135,7 +135,7 @@ void gamepad_init(void)
     if (gt_read(0x8047, cfg, 6) == ESP_OK)
         ESP_LOGI(TAG, "GT911 config v%u: resolucion X=%u Y=%u, puntos max=%u", cfg[0], cfg[1] | (cfg[2] << 8),
                  cfg[3] | (cfg[4] << 8), cfg[5] & 0x0F);
-    xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 7, NULL, 0);   /* prioridad mayor que video (5) y audio (6): su trabajo es minimo y no debe quedar sin CPU */
 }
 
 uint32_t gamepad_read(void) { return state; }
