@@ -36,6 +36,14 @@
 #include "gamepad.h"
 #include "zapper.h"
 
+extern volatile uint32_t nes_prof_cpu, nes_prof_ppu, nes_prof_map, nes_prof_total, nes_prof_draw, nes_prof_skip;
+static volatile uint32_t prof_apu, prof_copia;          /* ciclos acumulados: APU (muestras de audio) y copia del cuadro */
+static inline uint32_t prof_ccount(void)
+{
+    uint32_t c;
+    __asm__ __volatile__("rsr %0, ccount" : "=a"(c));
+    return c;
+}
 #define SAMPLERATE   22050
 #define FRAGSIZE     128
 #define NES_W        256
@@ -75,7 +83,9 @@ static void do_audio_frame(void)
     int left = SAMPLERATE / NES_REFRESH_RATE;
     while (left) {
         int n = left > FRAGSIZE ? FRAGSIZE : left;
+        uint32_t t_apu = prof_ccount();
         audio_callback(audio_in, n);
+        prof_apu += prof_ccount() - t_apu;
         uint32_t head = ring_head;
         uint32_t libres = RING_N - (head - __atomic_load_n(&ring_tail, __ATOMIC_ACQUIRE));
         if (libres < (uint32_t)n) {                   /* anillo lleno: se descarta, no se bloquea al emulador */
@@ -234,7 +244,9 @@ static void custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects)
     for (int i = 0; i < NSNAP; i++) if (snap_state[i] == 0) { w = i; break; }
     portEXIT_CRITICAL(&snap_mux);
     if (w >= 0 && snap[w]) {
+        uint32_t t_copia = prof_ccount();
         for (int y = 0; y < NES_H; y++) memcpy(snap[w] + y * NES_W, bmp->line[y], NES_W);
+        prof_copia += prof_ccount() - t_copia;
         portENTER_CRITICAL(&snap_mux);
         if (snap_wait >= 0) snap_state[snap_wait] = 0;   /* cuadro anterior sin mostrar: se descarta, gana el mas nuevo */
         snap_state[w] = 1;
@@ -283,6 +295,19 @@ static void videoTask(void *arg)
                      frames ? t_dibujo / 1000.0f / frames : 0.0f, conv_ms, espera_ms,
                      (unsigned)audio_perdidas);
             emu_n = 0; emu_sin_copia = 0;
+            {   /* tiempo medio por cuadro del emulador (ms): 240000 ciclos = 1 ms */
+                uint32_t cpu = nes_prof_cpu, ppu = nes_prof_ppu, map = nes_prof_map, tot = nes_prof_total;
+                uint32_t fd = nes_prof_draw, fs = nes_prof_skip, apu = prof_apu, copia = prof_copia;
+                nes_prof_cpu = nes_prof_ppu = nes_prof_map = nes_prof_total = 0;
+                nes_prof_draw = nes_prof_skip = 0;
+                prof_apu = prof_copia = 0;
+                uint32_t n = fd + fs ? fd + fs : 1;
+                float k = 1.0f / 240000.0f / n;
+                ESP_LOGI("emu", "ms/cuadro: total %.2f = CPU %.2f + PPU %.2f + mapper %.2f + otros %.2f | APU %.2f copia %.2f | "
+                         "dibujados %u saltados %u",
+                         tot * k, cpu * k, ppu * k, map * k, (tot - cpu - ppu - map) * k,
+                         apu * k, copia * k, (unsigned)fd, (unsigned)fs);
+            }
             frames = 0;
             t_dibujo = 0;
             t0 = now;

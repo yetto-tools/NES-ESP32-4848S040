@@ -293,21 +293,38 @@ void nes_nmi(void)
    nes6502_nmi();
 }
 
+/* ---- Medicion de rendimiento (ciclos de CPU del ESP32-S3; 240 MHz) ----
+** Se acumulan por categoria y video_audio.c los muestra cada 5 s. */
+volatile uint32_t nes_prof_cpu, nes_prof_ppu, nes_prof_map, nes_prof_total;
+volatile uint32_t nes_prof_draw, nes_prof_skip;
+
+static inline uint32_t prof_ccount(void)
+{
+   uint32_t c;
+   __asm__ __volatile__("rsr %0, ccount" : "=a"(c));
+   return c;
+}
+
 static void nes_renderframe(bool draw_flag)
 {
    int elapsed_cycles;
    mapintf_t *mapintf = nes.mmc->intf;
    int in_vblank = 0;
+   uint32_t p_cpu = 0, p_ppu = 0, p_map = 0, t, t_frame = prof_ccount();
 
    while (262 != nes.scanline)
    {
 //      ppu_scanline(nes.vidbuf, nes.scanline, draw_flag);
+      t = prof_ccount();
 		ppu_scanline(vid_getbuffer(), nes.scanline, draw_flag);
+      p_ppu += prof_ccount() - t;
 
       if (241 == nes.scanline)
       {
          /* 7-9 cycle delay between when VINT flag goes up and NMI is taken */
+         t = prof_ccount();
          elapsed_cycles = nes6502_execute(7);
+         p_cpu += prof_ccount() - t;
          nes.scanline_cycles -= elapsed_cycles;
          nes_checkfiq(elapsed_cycles);
 
@@ -319,18 +336,35 @@ static void nes_renderframe(bool draw_flag)
       } 
 
       if (mapintf->hblank)
+      {
+         t = prof_ccount();
          mapintf->hblank(in_vblank);
+         p_map += prof_ccount() - t;
+      }
 
       nes.scanline_cycles += (float) NES_SCANLINE_CYCLES;
+      t = prof_ccount();
       elapsed_cycles = nes6502_execute((int) nes.scanline_cycles);
+      p_cpu += prof_ccount() - t;
       nes.scanline_cycles -= (float) elapsed_cycles;
       nes_checkfiq(elapsed_cycles);
 
+      t = prof_ccount();
       ppu_endscanline(nes.scanline);
+      p_ppu += prof_ccount() - t;
       nes.scanline++;
    }
 
    nes.scanline = 0;
+
+   nes_prof_cpu += p_cpu;
+   nes_prof_ppu += p_ppu;
+   nes_prof_map += p_map;
+   nes_prof_total += prof_ccount() - t_frame;
+   if (draw_flag)
+      nes_prof_draw++;
+   else
+      nes_prof_skip++;
 }
 
 static void system_video(bool draw)

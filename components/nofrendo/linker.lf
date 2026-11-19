@@ -1,0 +1,11 @@
+# Codigo caliente del emulador en IRAM (en vez de ejecutarse desde la flash).
+# La cache de instrucciones del ESP32-S3 es de 16 KB y estas tres partes suman ~46 KB, asi que
+# ejecutadas desde la flash provocan muchos fallos de cache (cada uno cuesta una lectura de flash).
+# "noflash" mueve a RAM interna tanto el codigo (.text) como los datos de solo lectura (.rodata,
+# p. ej. la tabla de saltos de opcodes del 6502).
+[mapping:nofrendo_iram]
+archive: libnofrendo.a
+entries:
+    nes6502 (noflash)
+    nes_ppu (noflash)
+    nes_apu (noflash)

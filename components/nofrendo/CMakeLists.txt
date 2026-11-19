@@ -1,7 +1,8 @@
 file(GLOB SRCS *.c cpu/*.c libsnss/*.c nes/*.c sndhrdw/*.c mappers/*.c)
 
 idf_component_register(SRCS ${SRCS}
-                       INCLUDE_DIRS . cpu libsnss nes sndhrdw)
+                       INCLUDE_DIRS . cpu libsnss nes sndhrdw
+                       LDFRAGMENTS linker.lf)
 
 # Codigo C de 2001: silenciar avisos de compiladores modernos
 target_compile_options(${COMPONENT_LIB} PRIVATE
