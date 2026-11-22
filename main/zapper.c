@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <ctype.h>
 #include "nvs.h"
+#include "esp_partition.h"
+#include "esp_log.h"
+#include "esp_rom_crc.h"
 #include "sdkconfig.h"
 #include "zapper.h"
 
@@ -77,6 +80,34 @@ bool zapper_efectivo(const char *archivo)
     return m == ZAP_SI || (m == ZAP_AUTO && zapper_adivinar(archivo));
 }
 
+/* Firma (CRC32) de la ROM grabada en la particion nesgame: permite saber si el nombre "last" sigue
+ * correspondiendo a lo que hay en la flash (una ROM grabada con idf.py flash no actualiza "last"). */
+static uint32_t firma_particion(void)
+{
+    const esp_partition_t *p = esp_partition_find_first(0x40, 0x01, NULL);
+    uint8_t buf[4096], cab[16];
+    if (!p || esp_partition_read(p, 0, cab, 16) != ESP_OK || memcmp(cab, "NES", 4)) return 0;
+    size_t total = 16 + (size_t)cab[4] * 16384 + (size_t)cab[5] * 8192 + ((cab[6] & 4) ? 512 : 0);
+    if (total > p->size) total = p->size;
+    uint32_t crc = 0;
+    for (size_t off = 0; off < total; off += sizeof(buf)) {
+        size_t n = total - off > sizeof(buf) ? sizeof(buf) : total - off;
+        if (esp_partition_read(p, off, buf, n) != ESP_OK) return 0;
+        crc = esp_rom_crc32_le(crc, buf, n);
+    }
+    return crc;
+}
+
+void zapper_guardar_firma(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("nes", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, "lastsig", firma_particion());
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 void zapper_seleccionar(const char *archivo)
 {
     char last[256];
@@ -84,12 +115,18 @@ void zapper_seleccionar(const char *archivo)
         nvs_handle_t h;
         size_t len = sizeof(last);
         if (nvs_open("nes", NVS_READONLY, &h) == ESP_OK) {
-            if (nvs_get_str(h, "last", last, &len) == ESP_OK) archivo = last;
+            uint32_t sig = 0;
+            if (nvs_get_str(h, "last", last, &len) == ESP_OK &&
+                nvs_get_u32(h, "lastsig", &sig) == ESP_OK && sig == firma_particion())
+                archivo = last;
+            else
+                ESP_LOGW("zapper", "la ROM de la flash no es la ultima instalada desde la SD: valor por defecto");
             nvs_close(h);
         }
     }
     /* Sin nombre conocido (ROM grabada directo a la flash): valor por defecto de Kconfig */
     activo = archivo ? zapper_efectivo(archivo) : CONFIG_ZAPPER_ENABLE;
+    ESP_LOGI("zapper", "juego \"%s\": Zapper %s", archivo ? archivo : "(flash)", activo ? "activo" : "inactivo");
 }
 
 bool zapper_activo(void) { return activo; }

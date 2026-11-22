@@ -237,6 +237,7 @@ static void save_last(const char *path)
     nvs_handle_t h;
     if (nvs_open("nes", NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_str(h, "last", base_name(path));
+        zapper_guardar_firma();
         nvs_commit(h);
         nvs_close(h);
     }
