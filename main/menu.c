@@ -32,11 +32,11 @@ static const char *TAG = "menu";
 
 /* Diseno (pantalla 480x480, texto 8x8 con escala 2 = 16 px de alto) */
 #define TITLE_H    48
-#define ROW_H      40
-#define LIST_Y     (TITLE_H + 8)
-#define LIST_ROWS  9
 #define MAX_CHARS  26              /* ancho maximo del nombre a escala 2 */
-#define FOOT_Y     (LIST_Y + LIST_ROWS * ROW_H + 8)   /* 416 */
+#define CART_Y0    (TITLE_H + 6)   /* zona del carrusel */
+#define NAME_Y     348             /* titulo grande del juego */
+#define COUNT_Y    380
+#define FOOT_Y     404
 #define FOOT_H     56
 
 #define C_BLACK  RGB565(0, 0, 0)
@@ -196,7 +196,7 @@ out:
     return ok;
 }
 
-/* ---------- Dibujo del menu ---------- */
+/* ---------- Dibujo del menu: carrusel de cartuchos ---------- */
 static void draw_button(int x, int y, int w, int h, const char *label, uint16_t bg)
 {
     ui_fill_rect(x, y, w, h, C_GRAY);
@@ -205,31 +205,113 @@ static void draw_button(int x, int y, int w, int h, const char *label, uint16_t 
     ui_text(x + (w - lw) / 2, y + (h - 16) / 2, label, 2, C_WHITE);
 }
 
-static void draw_list(int sel, int top)
+#define C_FONDO  RGB565(22, 22, 30)
+#define C_CART   RGB565(150, 150, 158)     /* plastico gris del cartucho */
+#define C_CART_L RGB565(205, 205, 212)     /* borde claro */
+#define C_CART_D RGB565(80, 80, 90)        /* borde oscuro */
+
+/* Color de la etiqueta segun el nombre (FNV-1a): cada juego conserva siempre el suyo */
+static uint16_t color_etiqueta(const char *nombre)
 {
-    char line[MAX_CHARS + 4], name[MAX_CHARS + 1];
-    ui_fill_rect(0, LIST_Y, LCD_W, LIST_ROWS * ROW_H, C_BLACK);
-    for (int i = 0; i < LIST_ROWS; i++) {
-        int idx = top + i;
-        if (idx >= nroms) break;
-        display_name(roms[idx], name, MAX_CHARS - 2);
-        snprintf(line, sizeof(line), "%s", name);
-        int y = LIST_Y + i * ROW_H;
-        if (idx == sel) ui_fill_rect(6, y, LCD_W - 12, ROW_H - 4, C_BLUE);
-        ui_text(20, y + (ROW_H - 4 - 16) / 2, line, 2, idx == sel ? C_YELLOW : C_WHITE);
-        if (zapper_efectivo(base_name(roms[idx])))
-            ui_text(LCD_W - 40, y + (ROW_H - 4 - 16) / 2, "Z", 2, C_GREEN);   /* usa Zapper */
+    static const uint16_t paleta[] = {
+        RGB565(200, 40, 50), RGB565(40, 90, 200), RGB565(40, 150, 70), RGB565(225, 170, 30),
+        RGB565(225, 100, 30), RGB565(130, 60, 190), RGB565(30, 150, 160), RGB565(210, 70, 140),
+    };
+    uint32_t h = 2166136261u;
+    for (const char *p = nombre; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
+    return paleta[(h >> 8) % (sizeof(paleta) / sizeof(paleta[0]))];
+}
+
+/* Reparte el nombre en lineas de a lo sumo `ancho` caracteres (<=15), cortando por palabras; devuelve cuantas */
+static int partir_nombre(const char *nombre, int ancho, char lineas[][16], int max_lineas)
+{
+    int n = 0, len = 0;
+    char *cur = lineas[0];
+    cur[0] = 0;
+    const char *p = nombre;
+    while (*p == ' ' || *p == '_' || *p == '-') p++;
+    while (*p) {
+        const char *fin = p;
+        while (*fin && *fin != ' ' && *fin != '_' && *fin != '-') fin++;
+        int pl = (int)(fin - p);
+        if (pl > ancho) pl = ancho;
+        if (len && len + 1 + pl > ancho) {           /* no cabe: nueva linea */
+            if (n + 1 >= max_lineas) break;
+            cur = lineas[++n]; len = 0; cur[0] = 0;
+        }
+        if (len) cur[len++] = ' ';
+        memcpy(cur + len, p, pl); len += pl; cur[len] = 0;
+        p = fin;
+        while (*p == ' ' || *p == '_' || *p == '-') p++;
     }
-    /* contador y pie */
-    ui_fill_rect(0, FOOT_Y, LCD_W, LCD_H - FOOT_Y, C_BLACK);
+    return n + 1;
+}
+
+/* Oscurece un color RGB565 a la mitad (cartuchos que no estan seleccionados) */
+static uint16_t apagar(uint16_t c)
+{
+    return (uint16_t)((((c >> 11) & 31) / 2) << 11 | (((c >> 5) & 63) / 2) << 5 | ((c & 31) / 2));
+}
+
+/* Un cartucho NES de ancho w y alto h con centro horizontal en cx y borde superior en top */
+static void draw_cart(int cx, int top, int w, int h, const char *nombre, bool sel, bool zap)
+{
+    int x = cx - w / 2;
+    uint16_t et = color_etiqueta(nombre);
+    if (!sel) et = apagar(et);
+    ui_fill_rect(x + 4, top + 4, w, h, RGB565(8, 8, 12));                          /* sombra */
+    ui_fill_rect(x, top, w, h, sel ? C_CART : RGB565(95, 95, 102));
+    ui_fill_rect(x, top, w, 3, C_CART_L);  ui_fill_rect(x, top, 3, h, C_CART_L);
+    ui_fill_rect(x, top + h - 3, w, 3, C_CART_D);  ui_fill_rect(x + w - 3, top, 3, h, C_CART_D);
+    int ey = top + h / 12, eh = h / 28 > 1 ? h / 28 : 1;                           /* estrias superiores */
+    for (int i = 0; i < 3; i++) ui_fill_rect(x + w / 8, ey + i * (eh + 3), w * 3 / 4, eh, C_CART_D);
+    int lx = x + w / 10, ly = top + h * 22 / 100, lw = w * 8 / 10, lh = h * 52 / 100;   /* etiqueta */
+    ui_fill_rect(lx, ly, lw, lh, et);
+    ui_fill_rect(lx, ly, lw, lh / 7, RGB565(240, 240, 240));                       /* banda "NES" */
+    ui_text(lx + 4, ly + (lh / 7 - 8) / 2, "NES", 1, RGB565(60, 60, 70));
+    if (sel) {
+        int sc = w >= 160 ? 2 : 1;
+        char L[4][16];
+        int ancho = lw / (8 * sc) - 1;
+        int nl = partir_nombre(nombre, ancho > 15 ? 15 : ancho, L, 4);
+        int ty = ly + lh / 7 + (lh - lh / 7 - nl * 8 * sc - (nl - 1) * 4) / 2;
+        for (int i = 0; i < nl; i++)
+            ui_text(lx + (lw - (int)strlen(L[i]) * 8 * sc) / 2, ty + i * (8 * sc + 4), L[i], sc, C_WHITE);
+    } else {
+        char ini[2] = { nombre[0] ? nombre[0] : '?', 0 };
+        ui_text(lx + (lw - 24) / 2, ly + lh / 7 + (lh - lh / 7 - 24) / 2, ini, 3, RGB565(220, 220, 220));
+    }
+    int ny = top + h * 82 / 100;                                                    /* conector inferior */
+    ui_fill_rect(x + w / 6, ny, w * 2 / 3, h - (ny - top) - 3, C_CART_D);
+    ui_fill_rect(x + w / 4, ny + 3, w / 2, h - (ny - top) - 9, RGB565(30, 30, 36));
+    if (zap && sel) ui_text(x + w - 22, top + 8, "Z", 2, C_GREEN);                  /* usa Zapper */
+}
+
+static void draw_list(int sel)
+{
+    char name[MAX_CHARS + 1], vecino[MAX_CHARS + 1], line[24];
+    ui_fill_rect(0, CART_Y0, LCD_W, FOOT_Y - CART_Y0, C_FONDO);
+    if (sel > 0) {
+        display_name(roms[sel - 1], vecino, 12);
+        draw_cart(70, CART_Y0 + 90, 110, 140, vecino, false, false);
+    }
+    if (sel + 1 < nroms) {
+        display_name(roms[sel + 1], vecino, 12);
+        draw_cart(LCD_W - 70, CART_Y0 + 90, 110, 140, vecino, false, false);
+    }
+    display_name(roms[sel], name, MAX_CHARS);
+    draw_cart(LCD_W / 2, CART_Y0 + 8, 190, 270, name, true, zapper_efectivo(base_name(roms[sel])));
+    ui_text((LCD_W - (int)strlen(name) * 16) / 2, NAME_Y, name, 2, C_WHITE);
+    snprintf(line, sizeof(line), "%d / %d", sel + 1, nroms);
+    ui_text((LCD_W - (int)strlen(line) * 8) / 2, COUNT_Y, line, 1, C_GRAY);
+    /* pie: anterior, modo Zapper, jugar, siguiente */
     static const char *const ZL[] = { "ZAP:AUTO", "ZAP:SI", "ZAP:NO" };
+    ui_fill_rect(0, FOOT_Y, LCD_W, LCD_H - FOOT_Y, C_BLACK);
     draw_button(10, FOOT_Y, 70, FOOT_H, "<", C_BTN);
-    draw_button(88, FOOT_Y, 70, FOOT_H, ">", C_BTN);
-    draw_button(166, FOOT_Y, 150, FOOT_H, ZL[zapper_modo(base_name(roms[sel]))], C_BTN);
-    draw_button(324, FOOT_Y, 146, FOOT_H, "JUGAR", C_GREEN);
-    snprintf(line, sizeof(line), "%d/%d", sel + 1, nroms);
-    ui_text(14, FOOT_Y + FOOT_H + 2, line, 1, C_GRAY);
-    lcd_flush_rows(LIST_Y, LCD_H);
+    draw_button(88, FOOT_Y, 150, FOOT_H, ZL[zapper_modo(base_name(roms[sel]))], C_BTN);
+    draw_button(246, FOOT_Y, 146, FOOT_H, "JUGAR", C_GREEN);
+    draw_button(400, FOOT_Y, 70, FOOT_H, ">", C_BTN);
+    lcd_flush_rows(CART_Y0, LCD_H);
 }
 
 static void save_last(const char *path)
@@ -258,16 +340,16 @@ static int load_last(void)
     return idx;
 }
 
-/* Espera un toque nuevo (baja y sube el dedo) y devuelve su posicion */
-static void wait_tap(int *x, int *y)
+/* Espera un gesto: devuelve donde empezo y donde termino el dedo (un toque tiene inicio ~ fin) */
+static void wait_gesture(int *x0, int *y0, int *x1, int *y1)
 {
     int tx, ty;
     while (gamepad_touch(&tx, &ty)) vTaskDelay(pdMS_TO_TICKS(20));      /* soltar */
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
         if (gamepad_touch(&tx, &ty)) {
-            *x = tx; *y = ty;
-            while (gamepad_touch(&tx, &ty)) vTaskDelay(pdMS_TO_TICKS(20));
+            *x0 = *x1 = tx; *y0 = *y1 = ty;
+            while (gamepad_touch(&tx, &ty)) { *x1 = tx; *y1 = ty; vTaskDelay(pdMS_TO_TICKS(20)); }
             return;
         }
     }
@@ -276,53 +358,50 @@ static void wait_tap(int *x, int *y)
 /* Barra de titulo con el boton de calibracion del tactil (CAL, a la derecha) */
 #define CAL_X  374
 #define CAL_W  96
-static void draw_screen(int sel, int top)
+static void draw_screen(int sel)
 {
     clear_screen();
     ui_fill_rect(0, 0, LCD_W, TITLE_H, C_RED);
     text_center((TITLE_H - 16) / 2, "ELIGE UN JUEGO", 2, C_WHITE);
     draw_button(CAL_X, 6, CAL_W, TITLE_H - 12, "CAL", C_BTN);
-    draw_list(sel, top);
+    draw_list(sel);
     lcd_flush_rows(0, TITLE_H);
 }
 
+#define SWIPE_PX 50
+
 static int run_menu(void)
 {
-    int sel = load_last(), top = 0;
-    if (sel >= LIST_ROWS) top = sel - LIST_ROWS / 2;
-    if (top > nroms - LIST_ROWS) top = nroms - LIST_ROWS;
-    if (top < 0) top = 0;
-    draw_screen(sel, top);
+    int sel = load_last();
+    draw_screen(sel);
 
     for (;;) {
-        int x, y;
-        wait_tap(&x, &y);
-        int old = sel;
-        if (y < TITLE_H) {
-            if (x >= CAL_X - 8) {                       /* recalibrar el tactil y volver a la lista */
+        int x0, y0, x1, y1;
+        wait_gesture(&x0, &y0, &x1, &y1);
+        int old = sel, dx = x1 - x0, dy = y1 - y0;
+        if (abs(dx) >= SWIPE_PX && abs(dx) > abs(dy) && y0 >= CART_Y0 && y0 < FOOT_Y) {
+            sel += dx < 0 ? 1 : -1;                                                 /* deslizar: siguiente / anterior */
+        } else if (y0 < TITLE_H) {
+            if (x0 >= CAL_X - 8) {                                                  /* recalibrar el tactil y volver */
                 gamepad_calibrate(true);
-                draw_screen(sel, top);
+                draw_screen(sel);
             }
-        } else if (y >= FOOT_Y) {
-            if (x < 84)       sel = sel - LIST_ROWS < 0 ? 0 : sel - LIST_ROWS;        /* pagina anterior */
-            else if (x < 162) sel = sel + LIST_ROWS >= nroms ? nroms - 1 : sel + LIST_ROWS;
-            else if (x < 320) {                                                     /* modo Zapper del juego */
+        } else if (y0 >= FOOT_Y) {
+            if (x0 < 84)       sel--;                                               /* anterior */
+            else if (x0 < 242) {                                                    /* modo Zapper del juego */
                 const char *n = base_name(roms[sel]);
                 zapper_guardar_modo(n, (zapper_modo(n) + 1) % 3);
-                draw_list(sel, top);
-            } else return sel;                                                      /* JUGAR */
-        } else if (y >= LIST_Y && y < LIST_Y + LIST_ROWS * ROW_H) {
-            int idx = top + (y - LIST_Y) / ROW_H;
-            if (idx < nroms) {
-                if (idx == sel) return sel;       /* tocar de nuevo el seleccionado = jugar */
-                sel = idx;
-            }
+                draw_list(sel);
+            } else if (x0 < 396) return sel;                                        /* JUGAR */
+            else               sel++;                                               /* siguiente */
+        } else if (y0 >= CART_Y0) {
+            if (x0 < 135)               sel--;                                      /* cartucho de la izquierda */
+            else if (x0 >= LCD_W - 135) sel++;                                      /* cartucho de la derecha */
+            else return sel;                                                        /* cartucho central = jugar */
         }
-        if (sel != old) {
-            if (sel < top) top = sel;
-            if (sel >= top + LIST_ROWS) top = sel - LIST_ROWS + 1;
-            draw_list(sel, top);
-        }
+        if (sel < 0) sel = 0;
+        if (sel >= nroms) sel = nroms - 1;
+        if (sel != old) draw_list(sel);
     }
 }
 
