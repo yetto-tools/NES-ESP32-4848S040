@@ -925,7 +925,17 @@ static void ppu_renderoam(uint8 *vidbuf, int scanline)
       /* maximum of 8 sprites per scanline */
       if (++spritecount == PPU_MAXSPRITE)
       {
-         ppu.stat |= PPU_STATF_MAXSPRITE;
+         /* la bandera de desbordamiento solo se activa si hay un 9o sprite en esta linea
+         ** (antes se activaba con el 8o, antes de tiempo) */
+         for (sprite_num++, sprite_ptr++; sprite_num < 64; sprite_num++, sprite_ptr++)
+         {
+            if (sprite_ptr->y_loc < 239 &&
+                (unsigned)(scanline - sprite_ptr->y_loc - 1) < sprite_height)
+            {
+               ppu.stat |= PPU_STATF_MAXSPRITE;
+               break;
+            }
+         }
          break;
       }
    }
