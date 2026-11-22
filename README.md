@@ -111,6 +111,45 @@ La PSRAM no se lee directamente: pasa por la caché de datos del chip. Un acceso
 y una escritura grande se hace por ráfagas. Por eso conviene que **lo que se toca en cada línea o cada cuadro
 esté en RAM interna** y que la PSRAM guarde lo grande o lo que se lee de forma secuencial.
 
+### Diagrama de bloques de las memorias
+
+Todas las memorias, de la más lenta a la más rápida, y qué guarda cada una:
+
+```
+LENTA                                                                                                               RAPIDA
+┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐
+│ microSD                   │  │ FLASH                     │  │ PSRAM                     │  │ RAM INTERNA               │
+│ ~7.5 GB, SDMMC 1 bit      │  │ 16 MB, DIO 80 MHz         │  │ 8 MB, octal 80 MHz        │  │ 512 KB, la mas rapida     │
+├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤
+│ Archivos .nes             │─►│ factory   firmware        │─►│ ROM en uso (PRG+CHR)      │─►│ IRAM  CPU+PPU+APU 46 KB   │
+│ (biblioteca de            │  │           1 MB (445 KB)   │  │           hasta 1 MB      │  │ Bitmap del cuadro  60 KB  │
+│ juegos)                   │  │ nesgame   ROM en uso      │  │ Lienzo interfaz 450 KB    │  │ Bounce buffers    ~38 KB  │
+│                           │  │           1 MB (max.)     │  │ 3 copias cuadro 180 KB    │  │ Anillo de audio    8 KB   │
+│ Se lee solo al            │  │ nvs       ajustes 24 KB   │  │ libre     ~6.4 MB         │  │ Caches 16 KB + 64 KB      │
+│ elegir un juego           │  │ libre     ~13.9 MB        │  │                           │  │ RAM del NES 2 KB, VRAM    │
+└───────────────────────────┘  └───────────────────────────┘  └───────────────────────────┘  └───────────────────────────┘
+```
+
+La **ROM** (`nesgame`) pasa por tres lugares: la microSD, la flash y la PSRAM. En la flash queda guardada entre
+reinicios, y al arrancar el emulador se copia a PSRAM, que es de donde la leen la CPU y la PPU. La **RAM** del
+NES original (2 KB) y su memoria de vídeo viven en RAM interna, dentro de las estructuras del emulador.
+
+Y el camino de un cuadro, de la emulación al panel:
+
+```
+ ROM (PSRAM) ──caché──► CPU 6502 + PPU  ──dibuja──►  bitmap 256×240   (RAM interna)
+ (PRG + CHR)           (IRAM, núcleo 1)                     │
+                                                            │ copia (~1 ms)
+                                                            ▼
+                                       3 copias del cuadro (PSRAM) ── la más reciente
+                                                            │
+        Lienzo de la interfaz (PSRAM) ──┐                   │ la interrupción del panel
+                                        ├───► tira de 20 filas con paleta y escalado 1.5×
+                                        ┘                   │ (bounce buffer, RAM interna)
+                                                            ▼
+                                                    DMA ──► panel 480×480
+```
+
 ### Flash (16 MB)
 
 | Dirección | Tamaño | Contenido |
