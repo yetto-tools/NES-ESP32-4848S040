@@ -122,7 +122,7 @@ LENTA                                                                           
 │ ~7.5 GB, SDMMC 1 bit      │  │ 16 MB, DIO 80 MHz         │  │ 8 MB, octal 80 MHz        │  │ 512 KB, la mas rapida     │
 ├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤
 │ Archivos .nes             │─►│ factory   firmware        │─►│ ROM en uso (PRG+CHR)      │─►│ IRAM  CPU+PPU+APU 46 KB   │
-│ (biblioteca de            │  │           1 MB (445 KB)   │  │           hasta 1 MB      │  │ Bitmap del cuadro  60 KB  │
+│ (biblioteca de            │  │           1 MB (450 KB)   │  │           hasta 1 MB      │  │ Bitmap del cuadro  60 KB  │
 │ juegos)                   │  │ nesgame   ROM en uso      │  │ Lienzo interfaz 450 KB    │  │ Bounce buffers    ~38 KB  │
 │                           │  │           1 MB (max.)     │  │ 3 copias cuadro 180 KB    │  │ Anillo de audio    8 KB   │
 │ Se lee solo al            │  │ nvs       ajustes 24 KB   │  │ libre     ~6.4 MB         │  │ Caches 16 KB + 64 KB      │
@@ -158,7 +158,7 @@ Y el camino de un cuadro, de la emulación al panel:
 | `0x8000` | 4 KB | Tabla de particiones |
 | `0x9000` | 24 KB | `nvs`: ajustes (calibración del táctil, último juego, modo Zapper por juego) |
 | `0xF000` | 4 KB | `phy_init` |
-| `0x10000` | 1 MB | `factory`: el programa (la imagen actual ocupa unos 445 KB) |
+| `0x10000` | 1 MB | `factory`: el programa (la imagen actual ocupa unos 450 KB) |
 | `0x110000` | 1 MB | `nesgame`: la ROM instalada (máximo 1 MB) |
 | `0x210000` en adelante | ~13.9 MB | Libre |
 
@@ -177,7 +177,7 @@ Diagrama de secciones (las alturas **no** están a escala: el bloque libre es mu
  0x00F000  ├──────────────────────────────────────────────┤
            │ phy_init                             4 KB    │  calibración de radio (sin uso)
  0x010000  ├──────────────────────────────────────────────┤
-           │ factory  (programa)                  1 MB    │  el firmware: ~445 KB usados
+           │ factory  (programa)                  1 MB    │  el firmware: ~450 KB usados
            │ ████████████████████░░░░░░░░░░░░░░░░░░░░░░░░ │  (44 % de la partición)
  0x110000  ├──────────────────────────────────────────────┤
            │ nesgame  (ROM)                       1 MB    │  el juego instalado, máx. 1 MB
@@ -196,6 +196,96 @@ Cómo se usa cada sección:
 - **`nesgame`:** la ROM en uso. Con `idf.py flash` se graba `rom/game.nes`; desde el menú, al elegir un juego de
   la microSD, se copia aquí (solo si es distinto de lo que ya hay). Al arrancar el emulador se copia a PSRAM.
 - **`nvs`:** pares clave-valor que sobreviven a reinicios. `idf.py erase-flash` lo borra junto con toda la flash (hay que recalibrar el táctil).
+
+### Mapa funcional de la flash
+
+La flash no es memoria de trabajo: el procesador no la lee directamente. Esta sección explica **cómo arranca el
+chip desde ella, cómo llega su contenido al procesador y qué hay dentro del programa**.
+
+#### 1. Secuencia de arranque
+
+```
+ Encendido o reinicio
+    │
+    ▼
+ ① ROM del chip (grabada de fábrica, no se puede borrar)
+    │  lee los pines de arranque (strapping) y carga el segundo cargador desde la dirección 0x0000
+    ▼
+ ② Bootloader de ESP-IDF (flash 0x0000, 32 KB)
+    │  lee la tabla de particiones en 0x8000 → encuentra la partición «factory» (0x10000)
+    │  comprueba la imagen y copia a RAM los segmentos que deben vivir allí (IRAM, DRAM, RTC)
+    │  configura el MMU: enlaza las páginas de flash con el espacio de direcciones del procesador
+    ▼
+ ③ Arranque del sistema (en la partición «factory»)
+    │  inicia la PSRAM, el heap y los dos núcleos
+    ▼
+ ④ app_main (main/main.c)
+       calibra el táctil → menú de ROMs → copia la ROM de «nesgame» a PSRAM → inicia el emulador
+```
+
+#### 2. Cómo llega la flash al procesador
+
+La flash vive fuera del chip y **se accede por tres caminos distintos**:
+
+```
+                       ┌────────────────────────────── Caché ─────────────────────────────┐
+  Núcleos (240 MHz)    │                                                                  │     Flash 16 MB
+ ┌──────────────┐      │  instrucciones  16 KB ◄── MMU, páginas de 64 KB ──┐              │   ┌──────────────┐
+ │ ejecutar     │◄─────┤  (IROM, 0x4200_0000…)                              ├─────────────┼──►│ código       │ 252 KB
+ │ código       │      │                                                    │             │   ├──────────────┤
+ ├──────────────┤      │  datos  64 KB      ◄── MMU, páginas de 64 KB ──────┘             │   │ datos const. │  80 KB
+ │ leer         │◄─────┤  (DROM, 0x3C00_0000…)                                            │   ├──────────────┤
+ │ constantes   │      └──────────────────────────────────────────────────────────────────┘   │ ROM «nesgame»│  1 MB
+ └──────────────┘                                                                             │ NVS, tabla…  │
+ ┌──────────────┐   API del driver de flash (esp_partition_read / write / erase),               └──────┬───────┘
+ │ ROM del juego│◄── sin pasar por el MMU ─────────────────────────────────────────────────────────┘
+ │ y ajustes    │
+ └──────────────┘
+```
+
+- **Ejecutar en el sitio (XIP):** el código que no está en IRAM se ejecuta leyéndolo de la flash a través de la caché
+  de instrucciones. Cada fallo de caché cuesta una lectura de flash.
+- **Constantes (`.rodata`):** tablas, cadenas y datos de solo lectura se leen por la caché de datos.
+- **Particiones por API:** la ROM instalada y los ajustes (NVS) no se mapean; se leen, escriben y borran con
+  llamadas del driver. Escribir o borrar suspende la caché mientras dura la operación, así que el código que está
+  en la flash se detiene (por eso el código del emulador está en IRAM y por eso la imagen puede parpadear si se
+  instala una ROM, y probablemente también al leer la PSRAM, que pasa por la misma caché).
+- **Compartido con la PSRAM:** la ventana de datos (`0x3C00_0000…`) la usan tanto la flash como la PSRAM. Las
+  direcciones `0x3C…` que vemos en el log (por ejemplo la ROM copiada a PSRAM) salen de esa ventana.
+
+| Región del procesador | Direcciones | Qué contiene |
+|---|---|---|
+| IROM (instrucciones desde flash) | `0x4200_0000` en adelante | Código en flash |
+| DROM / PSRAM (datos externos) | `0x3C00_0000` en adelante | Constantes de la flash y PSRAM |
+| IRAM (instrucciones en RAM) | `0x4037_0000` en adelante | Código caliente y vectores de interrupción |
+| DRAM (datos en RAM) | `0x3FC8_8000` en adelante | `.data`, `.bss`, heap, pilas |
+| RTC | `0x600F_E000` | Memoria que sobrevive al sueño (casi sin usar aquí) |
+
+*Las direcciones salen del manual técnico del ESP32-S3; las de DRAM, RTC y PSRAM coinciden con las que muestra el
+log de arranque.*
+
+#### 3. Qué hay dentro de la imagen del programa
+
+La imagen de la partición `factory` mide **460 374 bytes (~450 KB, el 44 % de 1 MB)**. Medido con `idf.py size`:
+
+| Segmento | Dónde acaba | Tamaño | % de la imagen | Función |
+|---|---|---|---|---|
+| Código en flash (`.text`) | se ejecuta en la flash (IROM) | 251 920 B | 54.7 % | El sistema, los controladores, el menú, el resto del emulador |
+| Datos de solo lectura (`.rodata`) | se lee de la flash (DROM) | 81 728 B | 17.8 % | Tablas del emulador, cadenas, la fuente de texto |
+| Código en RAM (IRAM + DIRAM `.text`) | **se copia a RAM al arrancar** | 106 983 B | 23.2 % | CPU 6502, PPU y APU de Nofrendo (~46 KB), vectores y rutinas que no pueden esperar a la flash |
+| Datos inicializados (`.data`) | **se copia a RAM al arrancar** | 19 707 B | 4.3 % | Variables con valor inicial |
+| RTC | se copia a RAM RTC | 60 B | ~0 % | Casi sin usar |
+| `.bss` (no ocupa flash) | se pone a cero en RAM | 34 592 B | — | Variables sin valor inicial |
+
+Lo que importa de esta tabla:
+
+- Solo el **~28 %** de la imagen (código caliente y datos) se copia a RAM al arrancar; el otro **~72 %** se queda en
+  la flash y se lee por la caché.
+- Por eso mover el 6502, la PPU y la APU a IRAM fue tan efectivo: son los ~46 KB que más se ejecutan y con la
+  caché de instrucciones de 16 KB se expulsaban constantemente.
+- Tras la copia, el procesador no vuelve a leer ese ~28 % de la flash: solo lee de ella el código poco usado y las
+  constantes.
+- Quedan **~588 KB libres** en la partición `factory`, y ~13.9 MB sin particionar en la flash.
 
 ### RAM interna (SRAM, 512 KB)
 
