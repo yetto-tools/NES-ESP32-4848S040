@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #if CONFIG_AUDIO_I2S
 #include "driver/i2s_std.h"
@@ -181,13 +182,15 @@ static void set_palette(rgb_t *pal);
 static void clear(uint8 color) {}
 static bitmap_t *lock_write(void);
 static void free_write(int num_dirties, rect_t *dirty_rects);
-static void custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects);
+static void IRAM_ATTR custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects);
 
 static char fb[1];
 /* Copias privadas de cada cuadro del emulador: el hilo de video convierte y muestra una copia mientras el
  * emulador ya esta dibujando el siguiente cuadro en su propio buffer (leerlo directo partia la imagen).
- * Estados: 0 libre, 1 esperando a mostrarse (solo una, la mas reciente), 2 mostrandose. */
-#define NSNAP 3
+ * Estados: 0 libre, 1 esperando a mostrarse (solo una, la mas reciente), 2 mostrandose, 3 escribiendo.
+ * Con 2 copias en RAM interna (la copia a PSRAM costaba ~1.2 ms por cuadro) basta: si ninguna esta libre
+ * el emulador reutiliza la que espera, que de todos modos se descartaba. */
+#define NSNAP 2
 static uint8_t *snap[NSNAP];
 static uint8_t snap_state[NSNAP];
 static int snap_wait = -1;
@@ -236,16 +239,32 @@ static bitmap_t *lock_write(void)
 
 static void free_write(int num_dirties, rect_t *dirty_rects) { bmp_destroy(&myBitmap); }
 
-static void custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects)
+/* Copia de una linea (256 bytes) con palabras de 32 bits, ambos punteros alineados a 4 */
+static inline void IRAM_ATTR copiar_linea(uint32_t *restrict d, const uint32_t *restrict s)
+{
+    for (int i = 0; i < NES_W / 4; i += 8) {
+        uint32_t a0 = s[i], a1 = s[i + 1], a2 = s[i + 2], a3 = s[i + 3];
+        uint32_t a4 = s[i + 4], a5 = s[i + 5], a6 = s[i + 6], a7 = s[i + 7];
+        d[i] = a0; d[i + 1] = a1; d[i + 2] = a2; d[i + 3] = a3;
+        d[i + 4] = a4; d[i + 5] = a5; d[i + 6] = a6; d[i + 7] = a7;
+    }
+}
+
+static void IRAM_ATTR custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects)
 {
     int w = -1;
     emu_n++;
     portENTER_CRITICAL(&snap_mux);
-    for (int i = 0; i < NSNAP; i++) if (snap_state[i] == 0) { w = i; break; }
+    for (int i = 0; i < NSNAP; i++) if (snap_state[i] == 0 && snap[i]) { w = i; break; }
+    if (w < 0 && snap_wait >= 0) { w = snap_wait; snap_wait = -1; }   /* reutiliza la que esperaba: gana el cuadro mas nuevo */
+    if (w >= 0) snap_state[w] = 3;
     portEXIT_CRITICAL(&snap_mux);
     if (w >= 0 && snap[w]) {
         uint32_t t_copia = prof_ccount();
-        for (int y = 0; y < NES_H; y++) memcpy(snap[w] + y * NES_W, bmp->line[y], NES_W);
+        for (int y = 0; y < NES_H; y++) {
+            if ((((uintptr_t)bmp->line[y]) & 3) == 0) copiar_linea((uint32_t *)(snap[w] + y * NES_W), (const uint32_t *)bmp->line[y]);
+            else memcpy(snap[w] + y * NES_W, bmp->line[y], NES_W);
+        }
         prof_copia += prof_ccount() - t_copia;
         portENTER_CRITICAL(&snap_mux);
         if (snap_wait >= 0) snap_state[snap_wait] = 0;   /* cuadro anterior sin mostrar: se descarta, gana el mas nuevo */
@@ -438,8 +457,19 @@ int osd_init(void)
     lcd_init();
     ui_set_overlay(true);
     ui_draw_static();
-    for (int i = 0; i < NSNAP; i++)
-        snap[i] = heap_caps_malloc(NES_W * NES_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* RAM interna: primero el bitmap del emulador (se reserva despues, en vid_init; si cae a PSRAM la PPU y la
+     * copia se vuelven mucho mas lentas), luego las copias del cuadro mientras quede margen. Las que no
+     * caben van a PSRAM (mas lentas) y se usan solo si la interna esta ocupada. */
+    const size_t reserva_bitmap = NES_W * NES_H + 4096, margen = 40 * 1024;
+    for (int i = 0; i < NSNAP; i++) {
+        snap[i] = NULL;
+        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > reserva_bitmap + NES_W * NES_H + margen)
+            snap[i] = heap_caps_malloc(NES_W * NES_H, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!snap[i])
+            snap[i] = heap_caps_malloc(NES_W * NES_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ESP_LOGI("video", "copia %d del cuadro en %s", i, esp_ptr_internal(snap[i]) ? "RAM interna" : "PSRAM");
+    }
+    ESP_LOGI("video", "RAM interna libre tras las copias: %u KB", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     xTaskCreatePinnedToCore(&videoTask, "videoTask", 6144, NULL, 5, &video_task, 0);
     osd_initinput();
     return 0;
