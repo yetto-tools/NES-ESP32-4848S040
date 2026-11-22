@@ -123,6 +123,41 @@ esté en RAM interna** y que la PSRAM guarde lo grande o lo que se lee de forma 
 | `0x110000` | 1 MB | `nesgame`: la ROM instalada (máximo 1 MB) |
 | `0x210000` en adelante | ~13.9 MB | Libre |
 
+Diagrama de secciones (las alturas **no** están a escala: el bloque libre es mucho mayor que el resto):
+
+```
+ Dirección      Flash SPI de 16 MB (0x000000 - 0xFFFFFF)
+ ─────────────  ─────────────────────────────────────────────────────
+ 0x000000  ┌──────────────────────────────────────────────┐
+           │ Bootloader                          32 KB    │  arranca el chip
+ 0x008000  ├──────────────────────────────────────────────┤
+           │ Tabla de particiones                 4 KB    │  lista de estas secciones
+ 0x009000  ├──────────────────────────────────────────────┤
+           │ nvs                                 24 KB    │  ajustes: calibración, último
+           │                                              │  juego, modo Zapper por juego
+ 0x00F000  ├──────────────────────────────────────────────┤
+           │ phy_init                             4 KB    │  calibración de radio (sin uso)
+ 0x010000  ├──────────────────────────────────────────────┤
+           │ factory  (programa)                  1 MB    │  el firmware: ~445 KB usados
+           │ ████████████████████░░░░░░░░░░░░░░░░░░░░░░░░ │  (44 % de la partición)
+ 0x110000  ├──────────────────────────────────────────────┤
+           │ nesgame  (ROM)                       1 MB    │  el juego instalado, máx. 1 MB
+           │ █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │  (p. ej. SMB: 80 KB)
+ 0x210000  ├──────────────────────────────────────────────┤
+           │                                              │
+           │ Libre                            ~13.9 MB    │  sin usar
+           │                                              │
+ 0xFFFFFF  └──────────────────────────────────────────────┘
+```
+
+Cómo se usa cada sección:
+
+- **Bootloader y tabla de particiones:** el chip los lee al encender; con la tabla encuentra el programa.
+- **`factory`:** se graba con `idf.py flash`. Es el firmware completo.
+- **`nesgame`:** la ROM en uso. Con `idf.py flash` se graba `rom/game.nes`; desde el menú, al elegir un juego de
+  la microSD, se copia aquí (solo si es distinto de lo que ya hay). Al arrancar el emulador se copia a PSRAM.
+- **`nvs`:** pares clave-valor que sobreviven a reinicios. `idf.py erase-flash` lo borra junto con toda la flash (hay que recalibrar el táctil).
+
 ### RAM interna (SRAM, 512 KB)
 
 | Uso | Tamaño aprox. | Notas |
