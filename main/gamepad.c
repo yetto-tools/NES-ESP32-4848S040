@@ -16,6 +16,7 @@
 static const char *TAG = "touch";
 static i2c_master_dev_handle_t dev;
 static volatile uint32_t state;
+static volatile uint32_t latch;         /* botones pulsados desde la ultima lectura (no se pierden toques breves) */
 static volatile int tdown, tx, ty;      /* primer dedo (para el menu), ya calibrado */
 static volatile int rawx, rawy;         /* primer dedo, coordenadas crudas del GT911 */
 
@@ -68,8 +69,9 @@ static uint32_t hit(int x, int y)
 }
 
 /* El GT911 a veces entrega tramas vacias con el dedo puesto: se suelta el boton solo si pasan
- * RELEASE_US sin ningun punto, para que no parpadee (y los toques largos cuenten como largos) */
-#define RELEASE_US 120000
+ * RELEASE_US sin ningun punto, para que no parpadee (y los toques largos cuenten como largos).
+ * Debe ser menor que el intervalo entre toques repetidos (~100 ms), o la segunda pulsacion se pierde. */
+#define RELEASE_US 40000
 
 static void touch_task(void *arg)
 {
@@ -104,6 +106,7 @@ static void touch_task(void *arg)
         }
         if (esp_timer_get_time() - last_touch > RELEASE_US) { m = 0; tdown = 0; }   /* dedo levantado */
         state = m;
+        if (m) __atomic_fetch_or(&latch, m, __ATOMIC_RELAXED);
         was_down = tdown;
         if (m != prev) { ui_update(m); prev = m; }
         vTaskDelay(pdMS_TO_TICKS(4));
@@ -138,7 +141,8 @@ void gamepad_init(void)
     xTaskCreatePinnedToCore(touch_task, "touch", 4096, NULL, 7, NULL, 0);   /* prioridad mayor que video (5) y audio (6): su trabajo es minimo y no debe quedar sin CPU */
 }
 
-uint32_t gamepad_read(void) { return state; }
+/* Estado actual mas cualquier boton que se pulso (aunque ya se haya soltado) desde la lectura anterior */
+uint32_t gamepad_read(void) { return state | __atomic_exchange_n(&latch, 0, __ATOMIC_RELAXED); }
 
 int gamepad_touch(int *x, int *y)
 {
