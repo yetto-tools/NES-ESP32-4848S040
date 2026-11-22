@@ -18,6 +18,10 @@
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
 #endif
+#if CONFIG_AUDIO_I2S
+#include "driver/i2s_std.h"
+#endif
+#include <math.h>
 
 #include "lcd_rgb.h"
 #include "ui.h"
@@ -355,14 +359,64 @@ static void wait_gesture(int *x0, int *y0, int *x1, int *y1)
     }
 }
 
-/* Barra de titulo con el boton de calibracion del tactil (CAL, a la derecha) */
+/* Tono de prueba (440 Hz, ~1.5 s) por el mismo I2S que usa el juego: permite comprobar bocina, cableado y las
+ * resistencias R21-R23 sin cargar una ROM. Crea y destruye su propio canal para no interferir con el del juego. */
+static void prueba_sonido(void)
+{
+#if CONFIG_AUDIO_I2S
+    menu_message("Prueba de sonido", "440 Hz ...");
+    i2s_chan_handle_t tx = NULL;
+    i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    cc.auto_clear = true;
+    if (i2s_new_channel(&cc, &tx, NULL) != ESP_OK) {
+        menu_message("Prueba de sonido", "No se pudo crear el I2S");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        return;
+    }
+    i2s_std_config_t sc = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(22050),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED, .bclk = CONFIG_I2S_BCK, .ws = CONFIG_I2S_LRCK,
+            .dout = CONFIG_I2S_DIN, .din = I2S_GPIO_UNUSED, .invert_flags = { 0 },
+        },
+    };
+    if (i2s_channel_init_std_mode(tx, &sc) != ESP_OK || i2s_channel_enable(tx) != ESP_OK) {
+        i2s_del_channel(tx);
+        menu_message("Prueba de sonido", "No se pudo iniciar el I2S");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        return;
+    }
+    static int16_t buf[256 * 2];
+    uint32_t n = 0;
+    for (int blk = 0; blk < 130; blk++) {
+        for (int i = 0; i < 256; i++, n++) {
+            int16_t v = (int16_t)(sinf(2.0f * 3.14159265f * 440.0f * (float)(n % 22050) / 22050.0f) * 12000.0f);
+            buf[2 * i] = buf[2 * i + 1] = v;
+        }
+        size_t w;
+        if (i2s_channel_write(tx, buf, sizeof(buf), &w, pdMS_TO_TICKS(300)) != ESP_OK) break;
+    }
+    i2s_channel_disable(tx);
+    i2s_del_channel(tx);
+    ESP_LOGI(TAG, "prueba de sonido: tono de 440 Hz enviado (BCK=%d LRCK=%d DIN=%d)", CONFIG_I2S_BCK, CONFIG_I2S_LRCK, CONFIG_I2S_DIN);
+#else
+    menu_message("Prueba de sonido", "Audio desactivado");
+    vTaskDelay(pdMS_TO_TICKS(1500));
+#endif
+}
+
+/* Barra de titulo con los botones SND (prueba de sonido) y CAL (calibracion del tactil), a la derecha */
 #define CAL_X  374
 #define CAL_W  96
+#define SND_X  270
+#define SND_W  96
 static void draw_screen(int sel)
 {
     clear_screen();
     ui_fill_rect(0, 0, LCD_W, TITLE_H, C_RED);
-    text_center((TITLE_H - 16) / 2, "ELIGE UN JUEGO", 2, C_WHITE);
+    ui_text(14, (TITLE_H - 16) / 2, "ELIGE UN JUEGO", 2, C_WHITE);
+    draw_button(SND_X, 6, SND_W, TITLE_H - 12, "SND", C_BTN);
     draw_button(CAL_X, 6, CAL_W, TITLE_H - 12, "CAL", C_BTN);
     draw_list(sel);
     lcd_flush_rows(0, TITLE_H);
@@ -384,6 +438,9 @@ static int run_menu(void)
         } else if (y0 < TITLE_H) {
             if (x0 >= CAL_X - 8) {                                                  /* recalibrar el tactil y volver */
                 gamepad_calibrate(true);
+                draw_screen(sel);
+            } else if (x0 >= SND_X - 8) {                                           /* tono de prueba por la bocina */
+                prueba_sonido();
                 draw_screen(sel);
             }
         } else if (y0 >= FOOT_Y) {
