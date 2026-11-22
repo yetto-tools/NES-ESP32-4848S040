@@ -84,6 +84,81 @@ amplificador deciden a cuál van: **R21, R22, R23** a la bocina o **R25, R26, R2
 trae las resistencias en R25–R27, no sonará hasta que las muevas a R21–R23. No lo he verificado en todas
 las revisiones de la placa.
 
+## Mapa de memoria del dispositivo
+
+### Qué significa «N16R8»
+
+El módulo de la placa es un **ESP32-S3-WROOM-1-N16R8**. El sufijo describe la memoria externa que lleva:
+
+| Código | Significado | En esta placa |
+|---|---|---|
+| **N16** | Flash SPI de **16 MB** (donde viven el programa, la ROM y la configuración) | 16 MB, modo DIO a 80 MHz |
+| **R8** | **8 MB de PSRAM octal** (RAM externa, de 8 bits de bus) | 8 MB a 80 MHz |
+
+Es decir, además de la RAM que trae el propio chip, hay 8 MB de RAM extra, pero **no es igual de rápida**. La
+diferencia entre las dos es lo que más pesa en el rendimiento del emulador. Ojo: otras variantes (por ejemplo
+`N8` o `N16R2`) tienen menos flash o menos PSRAM y este proyecto necesita los 8 MB de PSRAM.
+
+### Resumen
+
+| Memoria | Tamaño | Velocidad real medida | Para qué se usa aquí |
+|---|---|---|---|
+| **RAM interna (SRAM)** | 512 KB en el chip (~266 KB libres para el *heap*) | ~360 MB/s al copiar el cuadro | Código caliente del emulador, bitmap del cuadro, anillo de audio, pilas de las tareas |
+| **PSRAM octal** | 8 MB externos | ~48 MB/s al copiar el cuadro (unas 7 veces más lenta) | ROM, lienzo de la interfaz, copias del cuadro |
+| **Flash** | 16 MB externos | Se lee por una caché de 16 KB (instrucciones) | Programa, ROM instalada, ajustes |
+
+La PSRAM no se lee directamente: pasa por la caché de datos del chip. Un acceso que no está en la caché espera,
+y una escritura grande se hace por ráfagas. Por eso conviene que **lo que se toca en cada línea o cada cuadro
+esté en RAM interna** y que la PSRAM guarde lo grande o lo que se lee de forma secuencial.
+
+### Flash (16 MB)
+
+| Dirección | Tamaño | Contenido |
+|---|---|---|
+| `0x0000` | 32 KB | Bootloader |
+| `0x8000` | 4 KB | Tabla de particiones |
+| `0x9000` | 24 KB | `nvs`: ajustes (calibración del táctil, último juego, modo Zapper por juego) |
+| `0xF000` | 4 KB | `phy_init` |
+| `0x10000` | 1 MB | `factory`: el programa (la imagen actual ocupa unos 445 KB) |
+| `0x110000` | 1 MB | `nesgame`: la ROM instalada (máximo 1 MB) |
+| `0x210000` en adelante | ~13.9 MB | Libre |
+
+### RAM interna (SRAM, 512 KB)
+
+| Uso | Tamaño aprox. | Notas |
+|---|---|---|
+| Código del emulador en IRAM | ~46 KB | CPU 6502, PPU y APU de Nofrendo (`components/nofrendo/linker.lf`). Fuera de la IRAM la caché de instrucciones de 16 KB fallaba mucho |
+| Cachés de instrucciones y de datos | 16 KB + 64 KB | Reservadas por el chip para leer flash y PSRAM |
+| Bitmap del emulador | 60 KB | 256×240 bytes donde dibuja la PPU. **Tiene que estar aquí** (ver abajo) |
+| Anillo de audio | 8 KB | 4096 muestras de 16 bits |
+| *Bounce buffers* del panel | ~38 KB | Dos tiras de 20 filas (480×20 px) que lee el DMA del panel |
+| Resto del *heap* | lo que sobra | Pilas de tareas, SD/FAT, I2C, I2S, etc. |
+
+### PSRAM (8 MB)
+
+| Uso | Tamaño | Notas |
+|---|---|---|
+| ROM del juego | hasta 1 MB | Se copia desde la flash al arrancar; la CPU y la PPU la leen por la caché |
+| Lienzo de la interfaz | 450 KB | 480×480 en RGB565: botones, menú y marcos |
+| Copias del cuadro | 3 × 60 KB | Tres copias de 256×240 (la CPU publica la más reciente; la interrupción del panel lee la última) |
+| Libre | ~6.4 MB | Margen para futuras mejoras |
+
+El panel **no tiene framebuffer**: una interrupción genera cada tira de 20 filas al vuelo, leyendo del cuadro y del
+lienzo, y precarga la caché con lo que leerá la siguiente tira. Así se ahorran ~1.4 MB de PSRAM y unos 7.5 ms por
+cuadro de volcado.
+
+### Qué implica en el rendimiento (lecciones medidas)
+
+- **El bitmap del emulador debe estar en RAM interna.** Si por cualquier razón cae a PSRAM (por ejemplo porque otra
+  reserva interna se hizo antes), la PPU y la copia se vuelven mucho más lentas. Hay que dejarle sitio antes de
+  reservar otros búferes internos.
+- **Copiar el cuadro a RAM interna** (probado antes de quitar los framebuffers) bajó la copia de 1.27 ms a 0.17 ms por
+  cuadro; hoy las copias están en PSRAM (~1 ms por cuadro), así que es una mejora pendiente.
+- **El código del emulador en IRAM** bajó la CPU de 6.5–7.5 ms a unos 2 ms por cuadro.
+- **Escribir en la PSRAM es lento** (unos 28–50 MB/s) y compite con el panel, que también la lee. Por eso se
+  evitaron los volcados grandes.
+- **Con 8 MB de PSRAM sobra espacio, pero no ancho de banda**: lo escaso es el tiempo de acceso, no los megabytes.
+
 ## Compilar y grabar
 
 Requisitos: ESP-IDF v6.1 instalado y exportado en la terminal.
@@ -176,20 +251,22 @@ components/nofrendo/   emulador (código de 2001, modificado)
 
 - **Núcleos:** el emulador corre solo en el núcleo 1. Panel, vídeo, audio y táctil corren en el núcleo 0
   (el táctil con prioridad 7 para que el vídeo no lo deje sin CPU).
-- **Vídeo:** el emulador copia cada cuadro (256×240) a un búfer privado; el hilo de vídeo siempre toma el más
-  reciente, lo escala 1.5× (se recortan 8 columnas por lado, como el overscan de una tele: imagen de 360×288)
-  y lo escribe en uno de **tres framebuffers** en PSRAM. El panel cambia de búfer al inicio de cada cuadro,
-  sin *tearing*. Reloj de píxel de 16 MHz (`LCD_PCLK_HZ` en `lcd_rgb.c`).
-- **Entrada:** se lee justo antes de emular cada cuadro.
+- **Vídeo:** el emulador copia cada cuadro (256×240) a una de tres copias privadas y publica la más reciente. El
+  panel RGB **no tiene framebuffer**: una interrupción construye cada tira de 20 filas al vuelo (paleta, escalado
+  1.5× con 8 columnas recortadas por lado, como el overscan de una tele: imagen de 360×288) y copia el resto del
+  lienzo de la interfaz. Cambia de cuadro solo al inicio del suyo, sin *tearing*. Reloj de píxel de 16 MHz
+  (`LCD_PCLK_HZ` en `lcd_rgb.c`).
+- **Entrada:** se lee justo antes del vblank (línea 241), que es cuando el juego la consulta.
 - **Reloj del emulador:** `esp_timer` a 60 Hz exactos.
 
 ## Rendimiento y limitaciones conocidas
 
-- El emulador va cerca de 60 cuadros/s, pero **la pantalla puede bajar a 22–45 fps** en cuadros pesados, porque la
-  conversión del cuadro y la interrupción del panel comparten el núcleo 0.
-- El panel usa *bounce buffer*: una interrupción copia ~28 MB/s con la CPU. Probé quitarlo y la imagen se
-  corrompió en esta placa, así que no se usa.
-- Cada 5 s el monitor serie muestra cuadros/s del emulador, fps en pantalla, tiempo de dibujo y audio perdido.
+- El emulador va a **60 cuadros/s sin cuadros saltados** y el panel a ~60.8 fps. Con Super Mario Bros usa unos
+  5 ms de los 16.7 ms del cuadro (CPU ~1.7, PPU ~3.3, APU ~0.4) y con Super Mario Bros 3 unos 5.8 ms.
+- La interrupción del panel cuesta ~2.9 ms por cuadro; la tira de 20 filas más lenta tarda ~350 µs de un
+  presupuesto de ~650 µs.
+- Cada 5 s el monitor serie muestra cuadros/s del emulador y del panel, el tiempo de la interrupción, la tira más
+  lenta, el reparto de ms por cuadro (CPU, PPU, mapper, APU, copia) y el audio perdido.
 - Super Mario Bros 3 (mapper MMC3) y el scroll rápido son los casos más exigentes.
 - Mappers soportados: los de Nofrendo (0–5, 7–9, 11, 15, 16, 18, 19, 24, 32–34, 40–42, 46, 50, 64–66, 70, 73,
   75, 78, 79, 85, 87, 93, 94, 99, 160, 229, 231 y VRC).
