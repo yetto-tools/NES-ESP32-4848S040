@@ -233,6 +233,75 @@ cuadro de volcado.
   evitaron los volcados grandes.
 - **Con 8 MB de PSRAM sobra espacio, pero no ancho de banda**: lo escaso es el tiempo de acceso, no los megabytes.
 
+## Lo que descubrimos de la placa 4848S040
+
+Resumen de lo que aprendimos sobre cómo está hecha la placa y cómo se comporta su memoria. Cada dato indica si lo
+**medimos** nosotros, lo **probamos** en la placa o lo tomamos de una **fuente externa**.
+
+### Estructura: qué conecta con qué
+
+```
+ ESP32-S3-WROOM-1 (N16R8)
+  │
+  ├── RGB de 16 bits (HSYNC 16, VSYNC 17, DE 18, PCLK 21, 16 datos) ────────► Panel ST7701 480×480
+  ├── SPI de 3 hilos por software (CS 39, SCK 48, SDA 47), solo al arrancar ► configura el ST7701
+  ├── GPIO 38 ──────────────────────────────────────────────────────────────► Luz de fondo
+  ├── I2C (SDA 19, SCL 45) ─────────────────────────────────────────────────► Táctil GT911 (0x5D)
+  ├── SDMMC de 1 bit (CLK 48, CMD 47, D0 41) ───────────────────────────────► microSD
+  ├── I2S (BCK 1, LRCK 2, DIN 40) ──► amplificador ──┬─ R21–R23 ──► P7 Speak (bocina)
+  │                                                  └─ R25–R27 ──► relés (los mismos GPIO 40, 2, 1)
+  ├── UART0 (TX 43, RX 44) ──► CH340 ──► USB-C (consola y grabación)
+  └── Flash y PSRAM octal (GPIO 35–37): dentro del módulo, no se pueden usar para otra cosa
+```
+
+### Descubrimientos sobre pines y periféricos
+
+1. **Tres pines hacen doble trabajo en el audio.** GPIO 1, 2 y 40 son el I2S y, en la versión con relés, los tres
+   relés. Cuál de los dos usos queda conectado depende de las resistencias de 0 Ω R21–R23 (bocina) o R25–R27 (relés).
+   *Fuente externa* ([LCD Wizard](https://lcdwizard.com/boards/guition-4848s040-speaker) y la configuración de
+   [esphome-modular-lvgl-buttons](https://github.com/agillis/esphome-modular-lvgl-buttons), que define los relés en
+   GPIO 40, 2 y 1). El audio **no está confirmado** en esta placa; ver el
+   [issue #11](https://github.com/yetto-tools/NES-ESP32-4848S040/issues/11). El menú tiene un botón **SND** que
+   reproduce un tono de prueba de 440 Hz.
+2. **GPIO 47 y 48 se reutilizan.** Primero configuran el ST7701 y después son CMD y CLK de la microSD. *Probado.*
+3. **La microSD funciona con una sola línea de datos (D0 = GPIO 41).** Se encontró probando candidatos
+   (41, 42, 40, 2, 1, 39). D1, D2 y D3 se dejan con *pull-up*: si D3 queda en bajo al iniciar, la tarjeta entra en
+   modo SPI y no monta. *Probado.*
+4. **El táctil GT911 manda tramas vacías con el dedo puesto.** Por eso el firmware solo suelta un botón tras 40 ms
+   sin puntos. Con 120 ms se perdían los toques repetidos rápidos. *Medido y probado.*
+5. **Reloj de píxel:** aquí se usa 16 MHz con el panel sin framebuffer. La configuración de ESPHome para esta
+   placa usa 6 MHz. *Fuente externa; el nuestro funciona con margen (la tira más lenta tarda ~350 µs de ~650 µs).*
+6. **El panel refresca a ~60.8 Hz y el emulador corre a 60.0 Hz.** Las dos fases derivan; es la causa probable de
+   un resto de latencia de entrada. *Medido.*
+
+### Descubrimientos sobre la memoria
+
+1. **La PSRAM es unas 7 veces más lenta que la RAM interna** al copiar un cuadro de 60 KB: ~1.27 ms a PSRAM frente
+   a ~0.17 ms entre RAM internas. *Medido.*
+2. **El bitmap donde dibuja la PPU tiene que estar en RAM interna.** Si cae a PSRAM, la PPU pasa de ~3.3 a ~4 ms
+   y la copia se vuelve más lenta. Pasó cuando una reserva interna se hizo antes de crear el bitmap, y se detectó
+   comprobando la dirección del búfer (`0x3C…` es PSRAM, `0x3FC…` es RAM interna). *Medido.*
+3. **El código del emulador debe ejecutarse desde IRAM.** La caché de instrucciones es de solo 16 KB y el 6502, la
+   PPU y la APU suman ~46 KB: fuera de la IRAM la CPU gastaba 6.5–7.5 ms por cuadro y con ella unos 2 ms. *Medido.*
+4. **Quitar el *bounce buffer* corrompe la imagen.** La causa no está confirmada.
+   Sí funciona generar cada tira de 20 filas en una interrupción y **precargar la caché** con lo que leerá la
+   siguiente tira. Con eso no hacen falta framebuffers en PSRAM (se liberan ~1.4 MB) y se ahorran ~7.5 ms por cuadro de
+   volcado. *Probado y medido.*
+5. **Sin precarga de caché, las ROM grandes desplazaban la imagen.** Con mapper 0 (Super Mario Bros) se veía bien y
+   con MMC3 (Super Mario Bros 3) se corrompía, probablemente por contención en el bus de la PSRAM. La precarga lo
+   resolvió.
+   *Probado.*
+6. **Sobra espacio, no ancho de banda.** De los 8 MB de PSRAM quedan ~6.4 MB libres, pero lo que limita es el tiempo de
+   acceso. *Medido.*
+7. **Escribir en la flash puede interrumpir la imagen unos instantes**, probablemente porque la caché de
+   instrucciones espera mientras la flash está ocupada. *Observado.*
+
+### Notas de desarrollo en este equipo
+
+- El puerto serie USB (CH340) cambia de número al mover el cable (por ejemplo COM12 y COM8), y abrirlo puede
+  **reiniciar la placa**. Para capturar el log de un juego hay que iniciar la captura antes de abrirlo desde el menú.
+- Los logs se emiten cada 5 s: `video:` (cuadros por segundo y la interrupción del panel) y `emu:` (ms por cuadro).
+
 ## Compilar y grabar
 
 Requisitos: ESP-IDF v6.1 instalado y exportado en la terminal.
