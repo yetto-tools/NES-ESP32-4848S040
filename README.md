@@ -287,6 +287,51 @@ Lo que importa de esta tabla:
   constantes.
 - Quedan **~588 KB libres** en la partición `factory`, y ~13.9 MB sin particionar en la flash.
 
+### Mapa funcional de la memoria externa: flash 16 MB + PSRAM 8 MB
+
+El módulo N16R8 lleva dos memorias fuera del chip, una **persistente** (la flash) y otra **volátil** (la PSRAM).
+Juntas suman 24 MB. Así se reparten el trabajo:
+
+```
+        FLASH  16 MB  (persistente)                       PSRAM  8 MB  (volátil: se borra al apagar)
+ ┌─────────────────────────────────────┐         ┌─────────────────────────────────────┐
+ │  libre                    ~13.9 MB  │         │  libre                     ~6.4 MB  │
+ │                                     │         │                                     │
+ ├─────────────────────────────────────┤         ├─────────────────────────────────────┤
+ │  nesgame  (ROM instalada)    1 MB   │────────►│  ROM en uso (PRG + CHR)    ≤ 1 MB   │
+ │  0x110000                           │ al      │  la leen la CPU y la PPU            │
+ ├─────────────────────────────────────┤ arrancar├─────────────────────────────────────┤
+ │  factory  (programa)         1 MB   │         │  lienzo de la interfaz     450 KB   │
+ │  0x010000       usa ~450 KB         │         │  480×480 en RGB565                  │
+ ├─────────────────────────────────────┤         ├─────────────────────────────────────┤
+ │  bootloader, tabla, nvs, phy_init   │         │  3 copias del cuadro       180 KB   │
+ │  0x000000                    64 KB  │         │  256×240, la más reciente se usa    │
+ └─────────────────────────────────────┘         └─────────────────────────────────────┘
+   usado 2.06 MB de 16 MB  (13 %)                   usado hasta ~1.6 MB de 8 MB  (~20 %)
+```
+
+| | Flash (N16) | PSRAM (R8) |
+|---|---|---|
+| Tamaño | 16 MB | 8 MB |
+| ¿Se conserva sin energía? | **Sí** | **No** |
+| Qué guarda aquí | programa, ROM instalada, ajustes | ROM en uso, lienzo de la interfaz, copias del cuadro |
+| Quién la escribe | `idf.py flash` y el menú al instalar una ROM (lento: hay que borrar por sectores de 4 KB) | el emulador, en cada cuadro y al abrir un juego (rápida pero ~7 veces más lenta que la RAM interna) |
+| Quién la lee | la caché de instrucciones y de datos; el driver, para la ROM y los ajustes | la CPU y la PPU (la ROM), y la interrupción del panel (lienzo y cuadro) |
+| Direcciones | ventana IROM `0x4200_0000…` y DROM `0x3C00_0000…`, por el MMU en páginas de 64 KB | ventana de datos `0x3C00_0000…`, compartida con la flash |
+| Reserva | fija, la define `partitions.csv` | dinámica: la pide el programa con `heap_caps_malloc`, sin direcciones fijas |
+| Espacio libre | ~13.9 MB | ~6.4 MB (con una ROM de 1 MB) |
+
+Cómo trabajan juntas:
+
+- **La ROM viaja flash → PSRAM.** Se instala una vez en la flash (desde la microSD o con `idf.py flash`) y se
+  conserva; en cada arranque se copia a PSRAM, que es de donde la lee el emulador. Con Super Mario Bros son
+  80 KB y con Super Mario Bros 3 unos 393 KB, así que casi siempre sobra espacio.
+- **La PSRAM guarda lo que cambia a cada instante** (el cuadro, el lienzo de la interfaz); la flash **solo lo que
+  se conserva**. No se escribe en la flash durante el juego: borrarla o escribirla detiene la caché y se vería como
+  un parpadeo.
+- **Lo más inmediato no vive en ninguna de las dos:** el código caliente del emulador y el bitmap donde dibuja la
+  PPU están en la RAM interna (ver el diagrama de bloques de arriba), porque la PSRAM es mucho más lenta.
+
 ### RAM interna (SRAM, 512 KB)
 
 | Uso | Tamaño aprox. | Notas |
