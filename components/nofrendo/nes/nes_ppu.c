@@ -52,6 +52,10 @@
 /* Full BG color */
 #define  FULLBG               (ppu.palette[0] | BG_TRANS)
 
+/* tablas de expansion de patrones del fondo (ver draw_bgtile) */
+static bool bgexp_ok = false;
+static void bgexp_init(void);
+
 /* the NES PPU */
 static ppu_t ppu;
 
@@ -216,6 +220,9 @@ static void mem_trash(uint8 *buffer, int length)
 /* reset state of ppu */
 void ppu_reset(int reset_type)
 {
+   if (!bgexp_ok)
+      bgexp_init();
+
    if (HARD_RESET == reset_type)
       mem_trash(ppu.oam, 256);
 
@@ -576,20 +583,52 @@ void ppu_setvromswitch(ppuvromswitch_t func)
 }
 
 /* rendering routines */
+/* Tabla: para cada byte de patron, los 4 bits altos (px 0-3) y bajos (px 4-7) expandidos a un byte
+** por pixel con valor 0 u 8 (desplazamiento en bits dentro de la paleta de 4 colores). */
+static uint32 bgexp_hi[256], bgexp_lo[256];
+
+static void bgexp_init(void)
+{
+   int b, i;
+   for (b = 0; b < 256; b++)
+   {
+      uint32 h = 0, l = 0;
+      for (i = 0; i < 4; i++)
+      {
+         if (b & (0x80 >> i)) h |= 8u << (8 * i);
+         if (b & (0x08 >> i)) l |= 8u << (8 * i);
+      }
+      bgexp_hi[b] = h;
+      bgexp_lo[b] = l;
+   }
+   bgexp_ok = true;
+}
+
 INLINE void draw_bgtile(uint8 *surface, uint8 pat1, uint8 pat2, 
                         const uint8 *colors)
 {
-   uint32 pattern = ((pat2 & 0xAA) << 8) | ((pat2 & 0x55) << 1)
-                    | ((pat1 & 0xAA) << 7) | (pat1 & 0x55);
-   
-   *surface++ = colors[(pattern >> 14) & 3];
-   *surface++ = colors[(pattern >> 6) & 3];
-   *surface++ = colors[(pattern >> 12) & 3];
-   *surface++ = colors[(pattern >> 4) & 3];
-   *surface++ = colors[(pattern >> 10) & 3];
-   *surface++ = colors[(pattern >> 2) & 3];
-   *surface++ = colors[(pattern >> 8) & 3];
-   *surface = colors[pattern & 3];
+   uint8 c0 = colors[0];
+
+   /* tile vacio (muy comun): un solo color */
+   if (0 == (pat1 | pat2))
+   {
+      surface[0] = surface[1] = surface[2] = surface[3] = c0;
+      surface[4] = surface[5] = surface[6] = surface[7] = c0;
+      return;
+   }
+
+   uint32 pal = c0 | (colors[1] << 8) | (colors[2] << 16) | ((uint32)colors[3] << 24);
+   uint32 h = bgexp_hi[pat1] | (bgexp_hi[pat2] << 1);
+   uint32 l = bgexp_lo[pat1] | (bgexp_lo[pat2] << 1);
+
+   surface[0] = pal >> (h & 0xFF);
+   surface[1] = pal >> ((h >> 8) & 0xFF);
+   surface[2] = pal >> ((h >> 16) & 0xFF);
+   surface[3] = pal >> (h >> 24);
+   surface[4] = pal >> (l & 0xFF);
+   surface[5] = pal >> ((l >> 8) & 0xFF);
+   surface[6] = pal >> ((l >> 16) & 0xFF);
+   surface[7] = pal >> (l >> 24);
 }
 
 INLINE int draw_oamtile(uint8 *surface, uint8 attrib, uint8 pat1, 
