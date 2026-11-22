@@ -8,9 +8,11 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+#include <stdatomic.h>
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "hal/cache_hal.h"
+#include "hal/cache_ll.h"
 #include "sdkconfig.h"
 #include "lcd_rgb.h"
 
@@ -29,67 +31,119 @@
  * con 16 MHz refresca a ~61 Hz. Si la imagen se ve inestable, volver a 12000000. */
 #define LCD_PCLK_HZ  16000000
 
+
 static const char *TAG = "lcd";
 
-/* Triple buffer sin tearing:
- *  - hw[0..2]: framebuffers del panel (PSRAM). El panel muestra uno ("shown"), otro puede estar pedido
- *    pero aun sin mostrarse ("req"), y el tercero esta libre para dibujar. Asi dibujar nunca espera
- *    al panel: el juego se renderiza en el libre y se pide como siguiente (si habia uno pedido que no
- *    llego a mostrarse, se descarta y gana el mas reciente).
- *  - fb: lienzo de la interfaz (botones, menu), que usan ui.c y menu.c; sus filas "sucias" se copian
- *    a cada hw[] antes de usarlo. */
-#define NFB 3
-static uint16_t *hw[NFB];
-static uint16_t *fb;
-/* Zonas de fb pendientes de copiar a cada hw[]: por fila, el rango de columnas [dx0, dx1) cambiado, y el rango de filas.
- * Antes solo se guardaban filas completas (el rango que envuelve todos los cambios): un boton obligaba a copiar ~180 filas. */
-static int16_t dx0[NFB][LCD_H], dx1[NFB][LCD_H];
-static int dy0[NFB], dy1[NFB];
-static portMUX_TYPE dmux = portMUX_INITIALIZER_UNLOCKED;   /* protege las marcas; no bloquea a la tarea del tactil */
+/* ======================= Pantalla SIN framebuffer =======================
+ * El panel RGB pide la imagen por tiras de 20 filas (bounce buffer). En vez de mantener framebuffers en PSRAM
+ * (convertir cada cuadro, escribirlo ~207 KB y que una interrupcion lo volviera a copiar), la propia interrupcion
+ * genera cada tira justo cuando hace falta:
+ *   - filas del juego: se convierten desde el cuadro de 256x240 (paleta de 8 bits) a RGB565 1.5x, con 8 columnas
+ *     recortadas por lado y margenes negros;
+ *   - resto (menus, botones, bordes): se copian del lienzo de la interfaz `fb` (RGB565 480x480 en PSRAM).
+ * Al inicio de cada cuadro del panel se adopta el ultimo cuadro publicado por el emulador, y se usa ese mismo
+ * durante todo el cuadro: sin tearing por construccion. */
+#define NSNAP 3                                  /* copias del cuadro del emulador */
+#define SIN  0xFF                                /* "ninguna" en el estado empaquetado */
+static uint16_t *fb;                             /* lienzo de la interfaz (ui.c, menu.c dibujan aqui) */
+static uint8_t *snap[NSNAP];                     /* cuadros 256x240 de 8 bits */
+/* Estado empaquetado en una sola variable atomica: bits 0-7 = copia que se esta mostrando (cur), bits 8-15 = ultima
+ * publicada y aun no mostrada (latest). Una sola variable evita la carrera entre emulador e interrupcion. */
+static _Atomic uint32_t estado = SIN | (SIN << 8);
+static volatile int mira_x = -1, mira_y = -1;    /* mira del Zapper (pantalla), -1 = sin mira */
+static const uint16_t *paleta;                   /* 256 colores RGB565 (la tabla vive en video_audio.c) */
+static uint16_t fila[LCD_W];                     /* fila del juego convertida, con margenes negros (RAM interna) */
+static int ultima_sy;
+static volatile uint32_t isr_cuadros, isr_us;    /* diagnostico */
+static volatile uint32_t isr_max_us, isr_lentas; /* peor tira y cuantas tiras superaron TIRA_LENTA_US */
+#define TIRA_LENTA_US 500                        /* cada tira dura ~650 us; por encima de 500 us el margen es peligroso */
+static bool inited;
 
-static void dirty_reset(void)
+static bool IRAM_ATTR bounce_cb(esp_lcd_panel_handle_t panel, void *buf, int pos_px, int len_bytes, void *ctx)
 {
-    for (int b = 0; b < NFB; b++) {
-        for (int y = 0; y < LCD_H; y++) { dx0[b][y] = LCD_W; dx1[b][y] = 0; }
-        dy0[b] = LCD_H; dy1[b] = -1;
-    }
-}
+    const int64_t t0 = esp_timer_get_time();
+    uint16_t *dst = (uint16_t *)buf;
+    const int y0 = pos_px / LCD_W;
+    const int filas = len_bytes / (LCD_W * 2);
 
-/* Marca [x0, x1) x [y0, y1) como cambiado para todos los buffers */
-static void mark(int x0, int y0, int x1, int y1)
-{
-    portENTER_CRITICAL(&dmux);
-    for (int b = 0; b < NFB; b++) {
-        for (int y = y0; y < y1; y++) {
-            if (x0 < dx0[b][y]) dx0[b][y] = (int16_t)x0;
-            if (x1 > dx1[b][y]) dx1[b][y] = (int16_t)x1;
+    if (pos_px == 0) {                           /* inicio de cuadro: adoptar el ultimo publicado */
+        uint32_t s = atomic_load(&estado);
+        for (;;) {
+            uint32_t lat = (s >> 8) & 0xFF;
+            if (lat == SIN) break;
+            if (atomic_compare_exchange_weak(&estado, &s, lat | (SIN << 8))) break;
         }
-        if (y0 < dy0[b]) dy0[b] = y0;
-        if (y1 - 1 > dy1[b]) dy1[b] = y1 - 1;
+        ultima_sy = -1;
+        isr_cuadros++;
     }
-    portEXIT_CRITICAL(&dmux);
-}
-static volatile int req, shown;
-static bool game_mode;                      /* true tras el primer cuadro de juego */
-static SemaphoreHandle_t lcd_mtx, frame_sem;
-static esp_lcd_panel_handle_t g_panel;
-static volatile int64_t st_conv, st_espera;   /* diagnostico: us convirtiendo/escribiendo y us esperando el cambio de buffer */
-static volatile int st_n;
+    const uint32_t cur = atomic_load(&estado) & 0xFF;
+    const uint16_t *pal = paleta;
+    const int mx = mira_x, my = mira_y;
+    const uint16_t rojo = RGB565(255, 40, 40);
 
-void lcd_stats(float *conv_ms, float *espera_ms)
-{
-    int n = st_n ? st_n : 1;
-    *conv_ms = st_conv / 1000.0f / n;
-    *espera_ms = st_espera / 1000.0f / n;
-    st_conv = 0; st_espera = 0; st_n = 0;
-}
+    for (int r = 0; r < filas; r++) {
+        const int y = y0 + r;
+        uint16_t *d = dst + (size_t)r * LCD_W;
+        if (cur == SIN || !pal || y >= GAME_Y + GAME_H) {      /* menu, o zona de controles: del lienzo */
+            memcpy(d, fb + (size_t)y * LCD_W, LCD_W * 2);
+            continue;
+        }
+        if (y < GAME_Y) {                                      /* borde superior negro durante el juego */
+            memset(d, 0, LCD_W * 2);
+            continue;
+        }
+        const int sy = (y - GAME_Y) * 5 / 6;                   /* 240/288: la fila de origen de esta fila de pantalla */
+        if (sy != ultima_sy) {
+            const uint8_t *src = snap[cur] + sy * 256 + IMG_CROP;      /* se descartan 8 columnas por lado (overscan) */
+            uint16_t *o = fila + IMG_X;
+            /* 240 columnas a 360 px = 1.5x: cada 2 pixeles origen (a, b) dan 3 de destino (a, a, b) */
+            for (int m = 0; m < IMG_W / 3; m++, o += 3) {
+                const uint16_t a = pal[src[2 * m]], b = pal[src[2 * m + 1]];
+                o[0] = a; o[1] = a; o[2] = b;
+            }
+            ultima_sy = sy;
+        }
+        memcpy(d, fila, LCD_W * 2);
+        if (mx >= 0) {                                         /* mira roja del Zapper */
+            const int dy = y - my;
+            if (dy >= -1 && dy <= 1) {
+                const int xa = mx - 10 < IMG_X ? IMG_X : mx - 10;
+                const int xb = mx + 11 > IMG_X + IMG_W ? IMG_X + IMG_W : mx + 11;
+                for (int x = xa; x < xb; x++) d[x] = rojo;
+            } else if (dy >= -10 && dy <= 10) {
+                for (int x = mx - 1; x <= mx + 1; x++)
+                    if (x >= IMG_X && x < IMG_X + IMG_W) d[x] = rojo;
+            }
+        }
+    }
+    /* Precarga de cache de lo que leera la SIGUIENTE tira desde PSRAM (como hace el controlador con su framebuffer):
+     * sin esto cada lectura espera a la PSRAM y, si el emulador la esta usando (ROM grande, p. ej. MMC3), la tira no
+     * llega a tiempo y la imagen se desplaza. */
+    const int yn = y0 + filas;
+    if (yn < LCD_H) {
+        const int fin_lienzo_desde = (cur == SIN || !pal) ? yn : (yn >= GAME_Y + GAME_H ? yn : GAME_Y + GAME_H);
+        if (fin_lienzo_desde < LCD_H && fin_lienzo_desde < yn + filas) {
+            int n = yn + filas - fin_lienzo_desde;
+            if (fin_lienzo_desde + n > LCD_H) n = LCD_H - fin_lienzo_desde;
+            cache_hal_preload(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA, (uint32_t)(fb + (size_t)fin_lienzo_desde * LCD_W),
+                              (uint32_t)n * LCD_W * 2, CACHE_PRELOAD_ORDER_ASCENDING);
+        }
+        if (cur != SIN && pal && yn < GAME_Y + GAME_H) {
+            const int ya = yn < GAME_Y ? GAME_Y : yn;
+            const int sy_a = (ya - GAME_Y) * 5 / 6;
+            int sy_b = (yn + filas - 1 - GAME_Y) * 5 / 6;
+            if (sy_b > 239) sy_b = 239;
+            if (sy_b >= sy_a)
+                cache_hal_preload(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA, (uint32_t)(snap[cur] + sy_a * 256),
+                                  (uint32_t)(sy_b - sy_a + 1) * 256, CACHE_PRELOAD_ORDER_ASCENDING);
+        }
+    }
 
-static bool IRAM_ATTR on_frame_free(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *e, void *u)
-{
-    BaseType_t hp = pdFALSE;
-    shown = req;                         /* al inicio de cada cuadro el panel adopta el ultimo buffer pedido */
-    xSemaphoreGiveFromISR(frame_sem, &hp);
-    return hp == pdTRUE;
+    const uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+    isr_us += dt;
+    if (dt > isr_max_us) isr_max_us = dt;
+    if (dt > TIRA_LENTA_US) isr_lentas++;
+    return false;
 }
 
 /* ---- ST7701: SPI de 3 hilos por bit-bang (9 bits: bit D/C + 8 de dato) ---- */
@@ -167,14 +221,24 @@ static void st7701_init(void)
     vTaskDelay(pdMS_TO_TICKS(30));
 }
 
+
 void lcd_init(void)
 {
-    if (fb) return;
+    if (inited) return;
+    inited = true;
     gpio_config_t bl = { .pin_bit_mask = 1ULL << PIN_BL, .mode = GPIO_MODE_OUTPUT };
     gpio_config(&bl);
     gpio_set_level(PIN_BL, 0);
 
     st7701_init();
+
+    /* Lienzo y copias de cuadro, ANTES de iniciar el panel: al arrancar pide filas enseguida */
+    fb = heap_caps_calloc((size_t)LCD_W * LCD_H, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_ERROR_CHECK(fb ? ESP_OK : ESP_ERR_NO_MEM);
+    for (int i = 0; i < NSNAP; i++) {
+        snap[i] = heap_caps_calloc(256 * 240, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ESP_ERROR_CHECK(snap[i] ? ESP_OK : ESP_ERR_NO_MEM);
+    }
 
     esp_lcd_rgb_panel_config_t cfg = {
         .clk_src = LCD_CLK_SRC_DEFAULT,
@@ -188,186 +252,62 @@ void lcd_init(void)
         .data_width = 16,
         .in_color_format = LCD_COLOR_FMT_RGB565,
         .out_color_format = LCD_COLOR_FMT_RGB565,
-        .num_fbs = NFB,
-        .bounce_buffer_size_px = LCD_W * 20,
+        .bounce_buffer_size_px = LCD_W * 20,          /* tiras de 20 filas */
         .hsync_gpio_num = PIN_HSYNC, .vsync_gpio_num = PIN_VSYNC,
         .de_gpio_num = PIN_DE, .pclk_gpio_num = PIN_PCLK, .disp_gpio_num = -1,
         .data_gpio_nums = DATA_PINS,
-        .flags = { .fb_in_psram = 1 },
+        .flags = { .no_fb = 1 },                      /* sin framebuffer: las filas las genera bounce_cb */
     };
     esp_lcd_panel_handle_t panel;
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&cfg, &panel));
-    g_panel = panel;
-    lcd_mtx = xSemaphoreCreateMutex();
-    frame_sem = xSemaphoreCreateBinary();
-    esp_lcd_rgb_panel_event_callbacks_t cbs = { .on_frame_buf_complete = on_frame_free };
+    esp_lcd_rgb_panel_event_callbacks_t cbs = { .on_bounce_empty = bounce_cb };
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel, &cbs, NULL));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
-    void *p0, *p1, *p2;
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel, NFB, &p0, &p1, &p2));
-    hw[0] = p0; hw[1] = p1; hw[2] = p2;
-    uint16_t *canvas = heap_caps_calloc((size_t)LCD_W * LCD_H, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_ERROR_CHECK(canvas ? ESP_OK : ESP_ERR_NO_MEM);
-    for (int b = 0; b < NFB; b++) {
-        memset(hw[b], 0, (size_t)LCD_W * LCD_H * 2);
-    }
-    dirty_reset();
-    req = shown = 0;                /* el panel arranca mostrando hw[0] */
-    fb = canvas;                    /* al final: lcd_init() sale temprano si fb ya existe */
-    lcd_fill(0);
     gpio_set_level(PIN_BL, 1);
-    ESP_LOGI(TAG, "LCD 480x480 listo");
+    ESP_LOGI(TAG, "LCD 480x480 listo (sin framebuffer: las filas se generan en la interrupcion del panel)");
 }
 
 uint16_t *lcd_fb(void) { return fb; }
 
-/* En modo "bounce buffer" el panel lee los hw[] a traves de la misma cache que usa la CPU, asi que no
- * hace falta esp_cache_msync (ESP-IDF tampoco lo hace en este modo). */
-
-/* Buffer libre: ni el que muestra el panel ni el ultimo pedido */
-static int libre(void)
-{
-    int r = req, sh = shown;
-    for (int i = 0; i < NFB; i++) if (i != r && i != sh) return i;
-    return 0;
-}
-
-/* Copia a hw[b] las filas de fb que cambiaron desde la ultima vez que se sincronizo ese buffer */
-static void sync_rows(int b)
-{
-    portENTER_CRITICAL(&dmux);
-    int ya = dy0[b], yb = dy1[b];
-    dy0[b] = LCD_H; dy1[b] = -1;                  /* lo que se marque desde ahora cuenta para la proxima vez */
-    portEXIT_CRITICAL(&dmux);
-    for (int y = ya; y <= yb; y++) {
-        portENTER_CRITICAL(&dmux);
-        int a = dx0[b][y], e = dx1[b][y];
-        dx0[b][y] = LCD_W; dx1[b][y] = 0;
-        portEXIT_CRITICAL(&dmux);
-        if (e > a) memcpy(hw[b] + (size_t)y * LCD_W + a, fb + (size_t)y * LCD_W + a, (size_t)(e - a) * 2);
-    }
-}
-
-/* Pide mostrar hw[w] en el siguiente cuadro del panel. No espera. */
-static void pedir(int w)
-{
-    esp_lcd_panel_draw_bitmap(g_panel, 0, 0, LCD_W, LCD_H, hw[w]);
-    req = w;
-}
-
-void lcd_flush_rows(int y0, int y1)
-{
-    if (y0 < 0) y0 = 0;
-    if (y1 > LCD_H) y1 = LCD_H;
-    if (y1 <= y0 || !lcd_mtx) return;
-    xSemaphoreTake(lcd_mtx, portMAX_DELAY);
-    mark(0, y0, LCD_W, y1);
-    if (!game_mode) {            /* menus y calibracion: mostrar ya y esperar a que se vea. En juego, con el siguiente cuadro */
-        int w = libre();
-        sync_rows(w);
-        xSemaphoreTake(frame_sem, 0);
-        pedir(w);
-        xSemaphoreTake(frame_sem, pdMS_TO_TICKS(60));
-    }
-    xSemaphoreGive(lcd_mtx);
-}
-
-/* Marca un rectangulo del lienzo como cambiado (en juego se copia a los buffers con el siguiente cuadro). No bloquea. */
-void lcd_dirty_rect(int x, int y, int w, int h)
-{
-    int x1 = x + w, y1 = y + h;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x1 > LCD_W) x1 = LCD_W;
-    if (y1 > LCD_H) y1 = LCD_H;
-    if (x1 <= x || y1 <= y) return;
-    mark(x, y, x1, y1);
-}
+/* El panel lee el lienzo en cada cuadro, asi que los cambios se ven solos con el siguiente cuadro (~16 ms).
+ * Estas funciones se conservan por compatibilidad con ui.c, menu.c y gamepad.c. */
+void lcd_flush_rows(int y0, int y1) { (void)y0; (void)y1; }
+void lcd_dirty_rect(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
 
 void lcd_fill(uint16_t color)
 {
     for (int i = 0; i < LCD_W * LCD_H; i++) fb[i] = color;
-    lcd_flush_rows(0, LCD_H);
 }
 
-/* Detalle del tiempo de dibujo (ciclos de CPU, 240 por microsegundo): calcular pixeles, volcar a PSRAM, sincronizar interfaz */
-static volatile uint32_t pc_calc, pc_vol, pc_sinc, pc_n;
-static inline uint32_t ccount(void)
+void lcd_set_palette(const uint16_t *pal) { paleta = pal; }
+void lcd_set_mira(int x, int y) { mira_x = x; mira_y = y; }
+
+/* Copia libre donde el emulador puede escribir el siguiente cuadro (ni la que se muestra, ni la ultima publicada) */
+uint8_t *lcd_frame_begin(void)
 {
-    uint32_t c;
-    __asm__ __volatile__("rsr %0, ccount" : "=a"(c));
-    return c;
+    const uint32_t s = atomic_load(&estado);
+    const uint32_t cur = s & 0xFF, lat = (s >> 8) & 0xFF;
+    for (uint32_t i = 0; i < NSNAP; i++)
+        if (i != cur && i != lat) return snap[i];
+    return NULL;
 }
 
-void lcd_stats_detalle(float *calc_ms, float *vol_ms, float *sinc_ms)
+/* Publica la copia completa: sustituye a la anterior publicada que no llego a mostrarse (gana la mas reciente) */
+void lcd_frame_publish(uint8_t *p)
 {
-    float k = 1.0f / 240000.0f / (pc_n ? pc_n : 1);
-    *calc_ms = pc_calc * k; *vol_ms = pc_vol * k; *sinc_ms = pc_sinc * k;
-    pc_calc = pc_vol = pc_sinc = pc_n = 0;
+    uint32_t idx = SIN;
+    for (uint32_t i = 0; i < NSNAP; i++) if (snap[i] == p) idx = i;
+    if (idx == SIN) return;
+    uint32_t s = atomic_load(&estado);
+    while (!atomic_compare_exchange_weak(&estado, &s, (s & 0xFF) | (idx << 8))) { }
 }
 
-void lcd_draw_game(const uint8_t **lines, const uint16_t *pal, int mira_x, int mira_y)
+void lcd_stats_isr(uint32_t *cuadros, float *ms_por_cuadro, uint32_t *max_us, uint32_t *lentas)
 {
-    static uint16_t rowbuf[IMG_W];
-    xSemaphoreTake(lcd_mtx, portMAX_DELAY);
-    int64_t t0 = esp_timer_get_time();
-    if (!game_mode) {
-        /* Primer cuadro de juego: las bandas laterales y el borde superior NO se redibujan en cada cuadro, asi
-         * que conservaban restos del menu y, al alternar entre los 3 buffers, parpadeaban. Se borran en el lienzo
-         * y se marcan todas las filas para que cada buffer se sincronice por completo la primera vez que se use. */
-        for (int y = 0; y < GAME_Y + GAME_H; y++) {
-            uint16_t *fila = fb + (size_t)y * LCD_W;
-            if (y < GAME_Y) {
-                for (int x = 0; x < LCD_W; x++) fila[x] = 0;
-            } else {
-                for (int x = 0; x < IMG_X; x++) fila[x] = 0;
-                for (int x = IMG_X + IMG_W; x < LCD_W; x++) fila[x] = 0;
-            }
-        }
-        mark(0, 0, LCD_W, LCD_H);
-    }
-    game_mode = true;
-    int w = libre();
-    { uint32_t cs = ccount(); sync_rows(w); pc_sinc += ccount() - cs; }                                              /* botones u otras filas de la interfaz pendientes */
-    uint16_t *base = hw[w];
-    int prev_sy = -1;
-    for (int y = 0; y < GAME_H; y++) {
-        int sy = y * 240 / GAME_H;
-        if (sy != prev_sy) {                                   /* linea de origen nueva: convertirla (si no, se repite la anterior) */
-            const uint8_t *src = lines[sy] + IMG_CROP;         /* se descartan 8 columnas por lado (overscan) */
-            /* 240 columnas a 360 px = 1.5x: cada 2 pixeles origen (a, b) dan 3 de destino (a, a, b) */
-            uint32_t cc = ccount();
-            uint16_t *o = rowbuf;
-            for (int m = 0; m < IMG_W / 3; m++, o += 3) {
-                uint16_t a = pal[src[2 * m]], b = pal[src[2 * m + 1]];
-                o[0] = a; o[1] = a; o[2] = b;
-            }
-            pc_calc += ccount() - cc;
-            prev_sy = sy;
-        }
-        uint32_t cv = ccount();
-        memcpy(base + (GAME_Y + y) * LCD_W + IMG_X, rowbuf, IMG_W * 2);
-        pc_vol += ccount() - cv;
-    }
-    if (mira_x >= 0) {                                         /* mira roja del Zapper, dentro del area de juego */
-        const uint16_t rojo = RGB565(255, 40, 40);
-        int x0 = mira_x - 10 < IMG_X ? IMG_X : mira_x - 10;
-        int x1 = mira_x + 11 > IMG_X + IMG_W ? IMG_X + IMG_W : mira_x + 11;
-        int y0 = mira_y - 10 < GAME_Y ? GAME_Y : mira_y - 10;
-        int y1 = mira_y + 11 > GAME_Y + GAME_H ? GAME_Y + GAME_H : mira_y + 11;
-        for (int y = mira_y - 1; y <= mira_y + 1; y++)
-            if (y >= GAME_Y && y < GAME_Y + GAME_H)
-                for (int x = x0; x < x1; x++) base[y * LCD_W + x] = rojo;
-        for (int y = y0; y < y1; y++)
-            for (int x = mira_x - 1; x <= mira_x + 1; x++)
-                if (x >= IMG_X && x < IMG_X + IMG_W) base[y * LCD_W + x] = rojo;
-    }
-    int64_t t1 = esp_timer_get_time();
-    pedir(w);
-    st_conv += t1 - t0;
-    st_espera += esp_timer_get_time() - t1;
-    st_n++;
-    pc_n++;
-    xSemaphoreGive(lcd_mtx);
+    const uint32_t f = isr_cuadros, us = isr_us;
+    *max_us = isr_max_us; *lentas = isr_lentas;
+    isr_cuadros = 0; isr_us = 0; isr_max_us = 0; isr_lentas = 0;
+    *cuadros = f;
+    *ms_por_cuadro = f ? us / 1000.0f / f : 0.0f;
 }

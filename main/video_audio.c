@@ -185,17 +185,6 @@ static void free_write(int num_dirties, rect_t *dirty_rects);
 static void IRAM_ATTR custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects);
 
 static char fb[1];
-/* Copias privadas de cada cuadro del emulador: el hilo de video convierte y muestra una copia mientras el
- * emulador ya esta dibujando el siguiente cuadro en su propio buffer (leerlo directo partia la imagen).
- * Estados: 0 libre, 1 esperando a mostrarse (solo una, la mas reciente), 2 mostrandose, 3 escribiendo.
- * Con 2 copias en RAM interna (la copia a PSRAM costaba ~1.2 ms por cuadro) basta: si ninguna esta libre
- * el emulador reutiliza la que espera, que de todos modos se descartaba. */
-#define NSNAP 2
-static uint8_t *snap[NSNAP];
-static uint8_t snap_state[NSNAP];
-static int snap_wait = -1;
-static portMUX_TYPE snap_mux = portMUX_INITIALIZER_UNLOCKED;
-static TaskHandle_t video_task;
 static volatile uint32_t emu_n, emu_sin_copia;   /* diagnostico: cuadros que entrega el emulador / sin copia libre */
 static bitmap_t *myBitmap;
 static uint16_t myPalette[256];
@@ -252,89 +241,50 @@ static inline void IRAM_ATTR copiar_linea(uint32_t *restrict d, const uint32_t *
 
 static void IRAM_ATTR custom_blit(bitmap_t *bmp, int num_dirties, rect_t *dirty_rects)
 {
-    int w = -1;
     emu_n++;
-    portENTER_CRITICAL(&snap_mux);
-    for (int i = 0; i < NSNAP; i++) if (snap_state[i] == 0 && snap[i]) { w = i; break; }
-    if (w < 0 && snap_wait >= 0) { w = snap_wait; snap_wait = -1; }   /* reutiliza la que esperaba: gana el cuadro mas nuevo */
-    if (w >= 0) snap_state[w] = 3;
-    portEXIT_CRITICAL(&snap_mux);
-    if (w >= 0 && snap[w]) {
+    uint8_t *d = lcd_frame_begin();                 /* copia libre; la interrupcion del panel la convierte y la muestra */
+    if (d) {
         uint32_t t_copia = prof_ccount();
         for (int y = 0; y < NES_H; y++) {
-            if ((((uintptr_t)bmp->line[y]) & 3) == 0) copiar_linea((uint32_t *)(snap[w] + y * NES_W), (const uint32_t *)bmp->line[y]);
-            else memcpy(snap[w] + y * NES_W, bmp->line[y], NES_W);
+            if ((((uintptr_t)bmp->line[y]) & 3) == 0) copiar_linea((uint32_t *)(d + y * NES_W), (const uint32_t *)bmp->line[y]);
+            else memcpy(d + y * NES_W, bmp->line[y], NES_W);
         }
         prof_copia += prof_ccount() - t_copia;
-        portENTER_CRITICAL(&snap_mux);
-        if (snap_wait >= 0) snap_state[snap_wait] = 0;   /* cuadro anterior sin mostrar: se descarta, gana el mas nuevo */
-        snap_state[w] = 1;
-        snap_wait = w;
-        portEXIT_CRITICAL(&snap_mux);
-        xTaskNotifyGive(video_task);
+        lcd_frame_publish(d);
     } else {
         emu_sin_copia++;
     }
     do_audio_frame();
 }
 
-/* Corre en el nucleo 1; la emulacion en el nucleo 0 */
-static void videoTask(void *arg)
+/* Registro de rendimiento cada 5 s (el dibujo ya no es una tarea: lo hace la interrupcion del panel) */
+static void stats_task(void *arg)
 {
-    int frames = 0;
-    int64_t t_dibujo = 0;                      /* tiempo total en lcd_draw_game (convertir + esperar el cambio de buffer) */
     TickType_t t0 = xTaskGetTickCount();
-    while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        int r = -1;
-        portENTER_CRITICAL(&snap_mux);
-        r = snap_wait;
-        if (r >= 0) { snap_state[r] = 2; snap_wait = -1; }
-        portEXIT_CRITICAL(&snap_mux);
-        if (r < 0) continue;
-        const uint8_t *ln[NES_H];
-        for (int y = 0; y < NES_H; y++) ln[y] = snap[r] + y * NES_W;
-        int mx = -1, my = -1, tx, ty;          /* mira roja donde el sistema cree que se disparo */
-        if (zapper_activo() && gamepad_touch(&tx, &ty) &&
-            tx >= GAME_X && tx < GAME_X + GAME_W && ty >= GAME_Y && ty < GAME_Y + GAME_H) { mx = tx; my = ty; }
-        int64_t t_ini = esp_timer_get_time();
-        lcd_draw_game(ln, myPalette, mx, my);
-        t_dibujo += esp_timer_get_time() - t_ini;
-        portENTER_CRITICAL(&snap_mux);
-        snap_state[r] = 0;
-        portEXIT_CRITICAL(&snap_mux);
-        frames++;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
         TickType_t now = xTaskGetTickCount();
-        if (now - t0 >= pdMS_TO_TICKS(5000)) {      /* FPS por el monitor serie */
-            float conv_ms, espera_ms;
-            lcd_stats(&conv_ms, &espera_ms);
-            float seg = pdTICKS_TO_MS(now - t0) / 1000.0f;
-            ESP_LOGI("video", "emulador %.1f cuadros/s (sin copia %u) -> pantalla %.1f fps, dibujo %.1f ms (convertir %.1f + esperar %.1f), audio perdido %u",
-                     emu_n / seg, (unsigned)emu_sin_copia, frames / seg,
-                     frames ? t_dibujo / 1000.0f / frames : 0.0f, conv_ms, espera_ms,
-                     (unsigned)audio_perdidas);
-            emu_n = 0; emu_sin_copia = 0;
-            {   /* tiempo medio por cuadro del emulador (ms): 240000 ciclos = 1 ms */
-                uint32_t cpu = nes_prof_cpu, ppu = nes_prof_ppu, map = nes_prof_map, tot = nes_prof_total;
-                uint32_t fd = nes_prof_draw, fs = nes_prof_skip, apu = prof_apu, copia = prof_copia;
-                nes_prof_cpu = nes_prof_ppu = nes_prof_map = nes_prof_total = 0;
-                nes_prof_draw = nes_prof_skip = 0;
-                prof_apu = prof_copia = 0;
-                uint32_t n = fd + fs ? fd + fs : 1;
-                float k = 1.0f / 240000.0f / n;
-                float d_calc, d_vol, d_sinc;
-                lcd_stats_detalle(&d_calc, &d_vol, &d_sinc);
-                ESP_LOGI("lcd", "dibujo por cuadro: calcular pixeles %.2f ms + volcar a PSRAM %.2f ms + sincronizar interfaz %.2f ms",
-                         d_calc, d_vol, d_sinc);
-                ESP_LOGI("emu", "ms/cuadro: total %.2f = CPU %.2f + PPU %.2f + mapper %.2f + otros %.2f | APU %.2f copia %.2f | "
-                         "dibujados %u saltados %u",
-                         tot * k, cpu * k, ppu * k, map * k, (tot - cpu - ppu - map) * k,
-                         apu * k, copia * k, (unsigned)fd, (unsigned)fs);
-            }
-            frames = 0;
-            t_dibujo = 0;
-            t0 = now;
-        }
+        float seg = pdTICKS_TO_MS(now - t0) / 1000.0f;
+        t0 = now;
+        uint32_t cuadros, tira_max, lentas; float isr_ms;
+        lcd_stats_isr(&cuadros, &isr_ms, &tira_max, &lentas);
+        ESP_LOGI("video", "emulador %.1f cuadros/s (sin copia %u) -> panel %.1f fps, interrupcion %.2f ms/cuadro, tira mas lenta %u us, "
+                 "tiras > 500 us: %u, audio perdido %u",
+                 emu_n / seg, (unsigned)emu_sin_copia, cuadros / seg, isr_ms, (unsigned)tira_max, (unsigned)lentas,
+                 (unsigned)audio_perdidas);
+        emu_n = 0; emu_sin_copia = 0;
+        /* tiempo medio por cuadro del emulador (ms): 240000 ciclos = 1 ms */
+        uint32_t cpu = nes_prof_cpu, ppu = nes_prof_ppu, map = nes_prof_map, tot = nes_prof_total;
+        uint32_t fd = nes_prof_draw, fs = nes_prof_skip, apu = prof_apu, copia = prof_copia;
+        nes_prof_cpu = nes_prof_ppu = nes_prof_map = nes_prof_total = 0;
+        nes_prof_draw = nes_prof_skip = 0;
+        prof_apu = prof_copia = 0;
+        uint32_t n = fd + fs ? fd + fs : 1;
+        float k = 1.0f / 240000.0f / n;
+        ESP_LOGI("emu", "ms/cuadro: total %.2f = CPU %.2f + PPU %.2f + mapper %.2f + otros %.2f | APU %.2f copia %.2f | "
+                 "dibujados %u saltados %u",
+                 tot * k, cpu * k, ppu * k, map * k, (tot - cpu - ppu - map) * k,
+                 apu * k, copia * k, (unsigned)fd, (unsigned)fs);
     }
 }
 
@@ -371,6 +321,11 @@ void osd_getinput(void)
             zap_apunta = ZAP_APUNTA;
         }
         was = t;
+        /* mira roja donde el sistema cree que se disparo: la dibuja la interrupcion del panel en cada cuadro */
+        if (zapper_activo() && t && tx >= IMG_X && tx < IMG_X + IMG_W && ty >= GAME_Y && ty < GAME_Y + GAME_H)
+            lcd_set_mira(tx, ty);
+        else
+            lcd_set_mira(-1, -1);
     }
     /* Start + Select + A + B = reinicio */
     static int combo = 0;
@@ -457,20 +412,8 @@ int osd_init(void)
     lcd_init();
     ui_set_overlay(true);
     ui_draw_static();
-    /* RAM interna: primero el bitmap del emulador (se reserva despues, en vid_init; si cae a PSRAM la PPU y la
-     * copia se vuelven mucho mas lentas), luego las copias del cuadro mientras quede margen. Las que no
-     * caben van a PSRAM (mas lentas) y se usan solo si la interna esta ocupada. */
-    const size_t reserva_bitmap = NES_W * NES_H + 4096, margen = 40 * 1024;
-    for (int i = 0; i < NSNAP; i++) {
-        snap[i] = NULL;
-        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > reserva_bitmap + NES_W * NES_H + margen)
-            snap[i] = heap_caps_malloc(NES_W * NES_H, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!snap[i])
-            snap[i] = heap_caps_malloc(NES_W * NES_H, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        ESP_LOGI("video", "copia %d del cuadro en %s", i, esp_ptr_internal(snap[i]) ? "RAM interna" : "PSRAM");
-    }
-    ESP_LOGI("video", "RAM interna libre tras las copias: %u KB", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
-    xTaskCreatePinnedToCore(&videoTask, "videoTask", 6144, NULL, 5, &video_task, 0);
+    lcd_set_palette(myPalette);
+    xTaskCreatePinnedToCore(&stats_task, "stats", 3072, NULL, 1, NULL, 0);
     osd_initinput();
     return 0;
 }
