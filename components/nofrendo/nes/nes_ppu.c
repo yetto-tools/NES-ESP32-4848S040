@@ -860,6 +860,11 @@ static void ppu_renderoam(uint8 *vidbuf, int scanline)
       bool check_strike;
       int strike_pixel;
 
+      /* rechazo rapido (equivale a la comprobacion de abajo): y_loc >= 239 o la linea no cae en
+      ** [y_loc+1, y_loc+altura] */
+      if (sprite_ptr->y_loc >= 239 || (unsigned)(scanline - sprite_ptr->y_loc - 1) >= sprite_height)
+         continue;
+
       sprite_y = sprite_ptr->y_loc + 1;
 
       /* Check to see if sprite is out of range */
