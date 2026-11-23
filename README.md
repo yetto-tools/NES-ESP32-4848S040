@@ -115,12 +115,14 @@ esté en RAM interna** y que la PSRAM guarde lo grande o lo que se lee de forma 
 
 Todas las memorias, de la más lenta a la más rápida, y qué guarda cada una:
 
+<a href="docs/diagramas/memorias.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/memorias-dark.png">
   <img alt="Mapa de memorias del ESP32-S3 N16R8" src="docs/diagramas/memorias.png">
 </picture>
+</a>
 
-*Los diagramas están en `docs/diagramas/` (PNG en versión clara y oscura) y se regeneran con `python docs/diagramas/generar_diagramas.py`.*
+*Los diagramas están en `docs/diagramas/` (PNG en versión clara y oscura) y se regeneran con `python docs/diagramas/generar_diagramas.py`. Haz clic en un diagrama para verlo a tamaño completo.*
 
 La **ROM** (`nesgame`) pasa por tres lugares: la microSD, la flash y la PSRAM. En la flash queda guardada entre
 reinicios, y al arrancar el emulador se copia a PSRAM, que es de donde la leen la CPU y la PPU. La **RAM** del
@@ -128,10 +130,12 @@ NES original (2 KB) y su memoria de vídeo viven en RAM interna, dentro de las e
 
 Y el camino de un cuadro, de la emulación al panel:
 
+<a href="docs/diagramas/pipeline-video.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/pipeline-video-dark.png">
   <img alt="Camino de un cuadro de la ROM al panel, por núcleos" src="docs/diagramas/pipeline-video.png">
 </picture>
+</a>
 
 ### Flash (16 MB)
 
@@ -147,10 +151,12 @@ Y el camino de un cuadro, de la emulación al panel:
 
 Diagrama de secciones (las alturas **no** están a escala: el bloque libre es mucho mayor que el resto):
 
+<a href="docs/diagramas/flash.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/flash-dark.png">
   <img alt="Mapa de la flash de 16 MB por direcciones" src="docs/diagramas/flash.png">
 </picture>
+</a>
 
 Cómo se usa cada sección:
 
@@ -167,19 +173,23 @@ chip desde ella, cómo llega su contenido al procesador y qué hay dentro del pr
 
 #### 1. Secuencia de arranque
 
+<a href="docs/diagramas/arranque.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/arranque-dark.png">
   <img alt="Secuencia de arranque: ROM del chip, bootloader, sistema y app_main" src="docs/diagramas/arranque.png">
 </picture>
+</a>
 
 #### 2. Cómo llega la flash al procesador
 
 La flash vive fuera del chip y **se accede por tres caminos distintos**:
 
+<a href="docs/diagramas/caches.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/caches-dark.png">
   <img alt="Los tres caminos de la flash al procesador: caché de instrucciones, caché de datos y API de particiones" src="docs/diagramas/caches.png">
 </picture>
+</a>
 
 - **Ejecutar en el sitio (XIP):** el código que no está en IRAM se ejecuta leyéndolo de la flash a través de la caché
   de instrucciones. Cada fallo de caché cuesta una lectura de flash.
@@ -230,10 +240,12 @@ Lo que importa de esta tabla:
 El módulo N16R8 lleva dos memorias fuera del chip, una **persistente** (la flash) y otra **volátil** (la PSRAM).
 Juntas suman 24 MB. Así se reparten el trabajo:
 
+<a href="docs/diagramas/memoria-externa.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/memoria-externa-dark.png">
   <img alt="Memoria externa: flash de 16 MB y PSRAM de 8 MB, y cómo viaja la ROM de una a otra" src="docs/diagramas/memoria-externa.png">
 </picture>
+</a>
 
 | | Flash (N16) | PSRAM (R8) |
 |---|---|---|
@@ -300,10 +312,12 @@ Resumen de lo que aprendimos sobre cómo está hecha la placa y cómo se comport
 
 ### Estructura: qué conecta con qué
 
+<a href="docs/diagramas/hardware.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/hardware-dark.png">
   <img alt="Hardware de la placa 4848S040: qué conecta con qué" src="docs/diagramas/hardware.png">
 </picture>
+</a>
 
 ### Descubrimientos sobre pines y periféricos
 
