@@ -230,23 +230,10 @@ Lo que importa de esta tabla:
 El módulo N16R8 lleva dos memorias fuera del chip, una **persistente** (la flash) y otra **volátil** (la PSRAM).
 Juntas suman 24 MB. Así se reparten el trabajo:
 
-```
-        FLASH  16 MB  (persistente)                       PSRAM  8 MB  (volátil: se borra al apagar)
- ┌─────────────────────────────────────┐         ┌─────────────────────────────────────┐
- │  libre                    ~13.9 MB  │         │  libre                     ~6.4 MB  │
- │                                     │         │                                     │
- ├─────────────────────────────────────┤         ├─────────────────────────────────────┤
- │  nesgame  (ROM instalada)    1 MB   │────────►│  ROM en uso (PRG + CHR)    ≤ 1 MB   │
- │  0x110000                           │ al      │  la leen la CPU y la PPU            │
- ├─────────────────────────────────────┤ arrancar├─────────────────────────────────────┤
- │  factory  (programa)         1 MB   │         │  lienzo de la interfaz     450 KB   │
- │  0x010000       usa ~450 KB         │         │  480×480 en RGB565                  │
- ├─────────────────────────────────────┤         ├─────────────────────────────────────┤
- │  bootloader, tabla, nvs, phy_init   │         │  3 copias del cuadro       180 KB   │
- │  0x000000                    64 KB  │         │  256×240, la más reciente se usa    │
- └─────────────────────────────────────┘         └─────────────────────────────────────┘
-   usado 2.06 MB de 16 MB  (13 %)                   usado hasta ~1.6 MB de 8 MB  (~20 %)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/memoria-externa-dark.png">
+  <img alt="Memoria externa: flash de 16 MB y PSRAM de 8 MB, y cómo viaja la ROM de una a otra" src="docs/diagramas/memoria-externa.png">
+</picture>
 
 | | Flash (N16) | PSRAM (R8) |
 |---|---|---|
