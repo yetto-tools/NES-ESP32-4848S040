@@ -115,20 +115,12 @@ esté en RAM interna** y que la PSRAM guarde lo grande o lo que se lee de forma 
 
 Todas las memorias, de la más lenta a la más rápida, y qué guarda cada una:
 
-```
-LENTA                                                                                                               RAPIDA
-┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐
-│ microSD                   │  │ FLASH                     │  │ PSRAM                     │  │ RAM INTERNA               │
-│ ~7.5 GB, SDMMC 1 bit      │  │ 16 MB, DIO 80 MHz         │  │ 8 MB, octal 80 MHz        │  │ 512 KB, la mas rapida     │
-├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤
-│ Archivos .nes             │─►│ factory   firmware        │─►│ ROM en uso (PRG+CHR)      │─►│ IRAM  CPU+PPU+APU 46 KB   │
-│ (biblioteca de            │  │           1 MB (450 KB)   │  │           hasta 1 MB      │  │ Bitmap del cuadro  60 KB  │
-│ juegos)                   │  │ nesgame   ROM en uso      │  │ Lienzo interfaz 450 KB    │  │ Bounce buffers    ~38 KB  │
-│                           │  │           1 MB (max.)     │  │ 3 copias cuadro 180 KB    │  │ Anillo de audio    8 KB   │
-│ Se lee solo al            │  │ nvs       ajustes 24 KB   │  │ libre     ~6.4 MB         │  │ Caches 16 KB + 64 KB      │
-│ elegir un juego           │  │ libre     ~13.9 MB        │  │                           │  │ RAM del NES 2 KB, VRAM    │
-└───────────────────────────┘  └───────────────────────────┘  └───────────────────────────┘  └───────────────────────────┘
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/memorias-dark.png">
+  <img alt="Mapa de memorias del ESP32-S3 N16R8" src="docs/diagramas/memorias.png">
+</picture>
+
+*Los diagramas están en `docs/diagramas/` (PNG en versión clara y oscura) y se regeneran con `python docs/diagramas/generar_diagramas.py`.*
 
 La **ROM** (`nesgame`) pasa por tres lugares: la microSD, la flash y la PSRAM. En la flash queda guardada entre
 reinicios, y al arrancar el emulador se copia a PSRAM, que es de donde la leen la CPU y la PPU. La **RAM** del
@@ -136,19 +128,10 @@ NES original (2 KB) y su memoria de vídeo viven en RAM interna, dentro de las e
 
 Y el camino de un cuadro, de la emulación al panel:
 
-```
- ROM (PSRAM) ──caché──► CPU 6502 + PPU  ──dibuja──►  bitmap 256×240   (RAM interna)
- (PRG + CHR)           (IRAM, núcleo 1)                     │
-                                                            │ copia (~1 ms)
-                                                            ▼
-                                       3 copias del cuadro (PSRAM) ── la más reciente
-                                                            │
-        Lienzo de la interfaz (PSRAM) ──┐                   │ la interrupción del panel
-                                        ├───► tira de 20 filas con paleta y escalado 1.5×
-                                        ┘                   │ (bounce buffer, RAM interna)
-                                                            ▼
-                                                    DMA ──► panel 480×480
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/pipeline-video-dark.png">
+  <img alt="Camino de un cuadro de la ROM al panel, por núcleos" src="docs/diagramas/pipeline-video.png">
+</picture>
 
 ### Flash (16 MB)
 
@@ -164,30 +147,10 @@ Y el camino de un cuadro, de la emulación al panel:
 
 Diagrama de secciones (las alturas **no** están a escala: el bloque libre es mucho mayor que el resto):
 
-```
- Dirección      Flash SPI de 16 MB (0x000000 - 0xFFFFFF)
- ─────────────  ─────────────────────────────────────────────────────
- 0x000000  ┌──────────────────────────────────────────────┐
-           │ Bootloader                          32 KB    │  arranca el chip
- 0x008000  ├──────────────────────────────────────────────┤
-           │ Tabla de particiones                 4 KB    │  lista de estas secciones
- 0x009000  ├──────────────────────────────────────────────┤
-           │ nvs                                 24 KB    │  ajustes: calibración, último
-           │                                              │  juego, modo Zapper por juego
- 0x00F000  ├──────────────────────────────────────────────┤
-           │ phy_init                             4 KB    │  calibración de radio (sin uso)
- 0x010000  ├──────────────────────────────────────────────┤
-           │ factory  (programa)                  1 MB    │  el firmware: ~450 KB usados
-           │ ████████████████████░░░░░░░░░░░░░░░░░░░░░░░░ │  (44 % de la partición)
- 0x110000  ├──────────────────────────────────────────────┤
-           │ nesgame  (ROM)                       1 MB    │  el juego instalado, máx. 1 MB
-           │ █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │  (p. ej. SMB: 80 KB)
- 0x210000  ├──────────────────────────────────────────────┤
-           │                                              │
-           │ Libre                            ~13.9 MB    │  sin usar
-           │                                              │
- 0xFFFFFF  └──────────────────────────────────────────────┘
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/flash-dark.png">
+  <img alt="Mapa de la flash de 16 MB por direcciones" src="docs/diagramas/flash.png">
+</picture>
 
 Cómo se usa cada sección:
 
@@ -204,44 +167,19 @@ chip desde ella, cómo llega su contenido al procesador y qué hay dentro del pr
 
 #### 1. Secuencia de arranque
 
-```
- Encendido o reinicio
-    │
-    ▼
- ① ROM del chip (grabada de fábrica, no se puede borrar)
-    │  lee los pines de arranque (strapping) y carga el segundo cargador desde la dirección 0x0000
-    ▼
- ② Bootloader de ESP-IDF (flash 0x0000, 32 KB)
-    │  lee la tabla de particiones en 0x8000 → encuentra la partición «factory» (0x10000)
-    │  comprueba la imagen y copia a RAM los segmentos que deben vivir allí (IRAM, DRAM, RTC)
-    │  configura el MMU: enlaza las páginas de flash con el espacio de direcciones del procesador
-    ▼
- ③ Arranque del sistema (en la partición «factory»)
-    │  inicia la PSRAM, el heap y los dos núcleos
-    ▼
- ④ app_main (main/main.c)
-       calibra el táctil → menú de ROMs → copia la ROM de «nesgame» a PSRAM → inicia el emulador
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/arranque-dark.png">
+  <img alt="Secuencia de arranque: ROM del chip, bootloader, sistema y app_main" src="docs/diagramas/arranque.png">
+</picture>
 
 #### 2. Cómo llega la flash al procesador
 
 La flash vive fuera del chip y **se accede por tres caminos distintos**:
 
-```
-                       ┌────────────────────────────── Caché ─────────────────────────────┐
-  Núcleos (240 MHz)    │                                                                  │     Flash 16 MB
- ┌──────────────┐      │  instrucciones  16 KB ◄── MMU, páginas de 64 KB ──┐              │   ┌──────────────┐
- │ ejecutar     │◄─────┤  (IROM, 0x4200_0000…)                              ├─────────────┼──►│ código       │ 252 KB
- │ código       │      │                                                    │             │   ├──────────────┤
- ├──────────────┤      │  datos  64 KB      ◄── MMU, páginas de 64 KB ──────┘             │   │ datos const. │  80 KB
- │ leer         │◄─────┤  (DROM, 0x3C00_0000…)                                            │   ├──────────────┤
- │ constantes   │      └──────────────────────────────────────────────────────────────────┘   │ ROM «nesgame»│  1 MB
- └──────────────┘                                                                             │ NVS, tabla…  │
- ┌──────────────┐   API del driver de flash (esp_partition_read / write / erase),               └──────┬───────┘
- │ ROM del juego│◄── sin pasar por el MMU ─────────────────────────────────────────────────────────┘
- │ y ajustes    │
- └──────────────┘
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/caches-dark.png">
+  <img alt="Los tres caminos de la flash al procesador: caché de instrucciones, caché de datos y API de particiones" src="docs/diagramas/caches.png">
+</picture>
 
 - **Ejecutar en el sitio (XIP):** el código que no está en IRAM se ejecuta leyéndolo de la flash a través de la caché
   de instrucciones. Cada fallo de caché cuesta una lectura de flash.
@@ -375,19 +313,10 @@ Resumen de lo que aprendimos sobre cómo está hecha la placa y cómo se comport
 
 ### Estructura: qué conecta con qué
 
-```
- ESP32-S3-WROOM-1 (N16R8)
-  │
-  ├── RGB de 16 bits (HSYNC 16, VSYNC 17, DE 18, PCLK 21, 16 datos) ────────► Panel ST7701 480×480
-  ├── SPI de 3 hilos por software (CS 39, SCK 48, SDA 47), solo al arrancar ► configura el ST7701
-  ├── GPIO 38 ──────────────────────────────────────────────────────────────► Luz de fondo
-  ├── I2C (SDA 19, SCL 45) ─────────────────────────────────────────────────► Táctil GT911 (0x5D)
-  ├── SDMMC de 1 bit (CLK 48, CMD 47, D0 41) ───────────────────────────────► microSD
-  ├── I2S (BCK 1, LRCK 2, DIN 40) ──► amplificador ──┬─ R21–R23 ──► P7 Speak (bocina)
-  │                                                  └─ R25–R27 ──► relés (los mismos GPIO 40, 2, 1)
-  ├── UART0 (TX 43, RX 44) ──► CH340 ──► USB-C (consola y grabación)
-  └── Flash y PSRAM octal (GPIO 35–37): dentro del módulo, no se pueden usar para otra cosa
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagramas/hardware-dark.png">
+  <img alt="Hardware de la placa 4848S040: qué conecta con qué" src="docs/diagramas/hardware.png">
+</picture>
 
 ### Descubrimientos sobre pines y periféricos
 
