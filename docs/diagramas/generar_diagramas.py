@@ -450,6 +450,67 @@ def caches():
     return s, "Architecture", "Tres caminos de la flash al procesador"
 
 
+# ======================================================================================
+# 7. Memoria externa: flash + PSRAM (Layer stack x2)
+# ======================================================================================
+def memoria_externa():
+    s = Svg("memoria-externa", "Memoria externa: flash de 16 MB y PSRAM de 8 MB",
+            "La flash conserva el programa, la ROM instalada y los ajustes; la PSRAM guarda lo que cambia a cada instante. La ROM viaja de la flash a la PSRAM en cada arranque.",
+            1200, 560)
+    top, rh, w = 96, 72, 460
+    cols = [
+        (60, "FLASH", "16 MB · persistente · se conserva sin energía", [
+            ("libre", "~13.9 MB", "sin particionar", "dashed"),
+            ("nesgame", "1 MB", "0x110000 · ROM instalada", "focal"),
+            ("factory", "1 MB", "0x10000 · el programa, usa ~450 KB", "plain"),
+            ("bootloader, tabla, nvs, phy_init", "64 KB", "0x0000 · arranque y ajustes", "plain")],
+         0.13, "usado 2.06 MB de 16 MB (13 %)"),
+        (680, "PSRAM", "8 MB · volátil · se borra al apagar", [
+            ("libre", "~6.4 MB", "con una ROM de 1 MB", "dashed"),
+            ("ROM en uso (PRG + CHR)", "≤ 1 MB", "la leen la CPU y la PPU", "plain"),
+            ("lienzo de la interfaz", "450 KB", "480×480 en RGB565", "plain"),
+            ("3 copias del cuadro", "180 KB", "256×240 · se usa la más reciente", "plain")],
+         0.20, "usado hasta ~1.6 MB de 8 MB (~20 %)"),
+    ]
+    # flecha de la ROM: misma fila en las dos pilas (fila 1)
+    ay = top + rh + rh // 2
+    s.path([(60 + w, ay), (680, ay)], "link", 1.8)
+    s.label(60 + w + 80, ay - 16, "AL ARRANCAR", "link")
+    for (x, title, sub, rows, frac, usado) in cols:
+        s.a(f'<text x="{x}" y="{top - 44}" fill="{P["ink"]}" font-size="18" font-weight="600" font-family="{SANS}">{title}</text>')
+        s.a(f'<text x="{x}" y="{top - 24}" fill="{P["muted"]}" font-size="10" font-family="{MONO}">{sub}</text>')
+        h = rh * len(rows)
+        s.a(f'<rect x="{x}" y="{top}" width="{w}" height="{h}" rx="6" fill="{P["paper"]}"/>')
+        for i, (name, size, detail, kind) in enumerate(rows):
+            y = top + i * rh
+            fill = P["tint"] if kind == "focal" else (P["fill"] if i % 2 == 0 else "none")
+            s.a(f'<rect x="{x}" y="{y}" width="{w}" height="{rh}" fill="{fill}"/>')
+            if i:
+                s.a(f'<line x1="{x}" y1="{y}" x2="{x + w}" y2="{y}" stroke="{P["rule"]}" stroke-width="1"/>')
+            col = P["muted"] if kind == "dashed" else P["ink"]
+            s.a(f'<text x="{x + 20}" y="{y + 31}" fill="{col}" font-size="14" font-weight="600" font-family="{SANS}">{name}</text>')
+            s.a(f'<text x="{x + 20}" y="{y + 51}" fill="{P["muted"]}" font-size="10" font-family="{MONO}">{detail}</text>')
+            s.a(f'<text x="{x + w - 20}" y="{y + 31}" fill="{P["soft"]}" font-size="10" font-family="{MONO}" text-anchor="end">{size}</text>')
+        s.a(f'<rect x="{x}" y="{top}" width="{w}" height="{rh}" fill="none" stroke="{P["soft"]}" stroke-width="1" stroke-dasharray="5,4"/>')
+        for i, (name, size, detail, kind) in enumerate(rows):
+            if kind == "focal":
+                s.a(f'<rect x="{x}" y="{top + i * rh}" width="{w}" height="{rh}" fill="none" stroke="{P["accent"]}" stroke-width="1.5"/>')
+        s.a(f'<rect x="{x}" y="{top}" width="{w}" height="{h}" rx="6" fill="none" stroke="{P["ink"]}" stroke-width="1"/>')
+        by = top + h + 22
+        s.a(f'<rect x="{x}" y="{by}" width="{w}" height="8" rx="2" fill="{P["bar"]}"/>')
+        s.a(f'<rect x="{x}" y="{by}" width="{w * frac:.0f}" height="8" rx="2" fill="{P["link"]}"/>')
+        s.a(f'<text x="{x}" y="{by + 26}" fill="{P["muted"]}" font-size="10" font-family="{MONO}">{usado}</text>')
+    s.callout(60, 462, "no se escribe en la flash durante el juego:", "accent")
+    s.callout(60, 482, "borrarla o escribirla detiene la caché.", "accent")
+    s.callout(680, 462, "la PSRAM guarda lo que cambia a cada instante;", "ink")
+    s.callout(680, 482, "la flash, solo lo que se conserva.", "ink")
+    s.legend([("link", False, "copia de la ROM, una vez por arranque")], y=s.h - 44)
+    sx = 470
+    s.a(f'<rect x="{sx}" y="{s.h - 39}" width="22" height="12" fill="{P["tint"]}" stroke="{P["accent"]}" stroke-width="1"/>')
+    s.a(f'<text x="{sx + 32}" y="{s.h - 30}" fill="{P["muted"]}" font-size="10" font-family="{MONO}">la ROM instalada: escribirla detiene la caché</text>')
+    return s, "Layer stack", "La flash guarda, la PSRAM trabaja"
+
+
 def find_browser():
     for env in ("EDGE", "CHROME"):
         if os.environ.get(env):
@@ -487,7 +548,8 @@ if __name__ == "__main__":
     for theme in ("light", "dark"):
         use_theme(theme)
         for fn, name in ((memorias, "memorias"), (hardware, "hardware"), (pipeline, "pipeline-video"),
-                         (flash, "flash"), (arranque, "arranque"), (caches, "caches")):
+                         (flash, "flash"), (arranque, "arranque"), (caches, "caches"),
+                         (memoria_externa, "memoria-externa")):
             s, eyebrow, h1 = fn()
             stem = f"{name}{'-dark' if theme == 'dark' else ''}"
             if html_dir:
